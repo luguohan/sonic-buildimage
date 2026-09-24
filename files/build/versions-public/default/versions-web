@@ -20,6 +20,9 @@ https://downloadcontent.opensuse.org/repositories/home:/p4lang/Debian_11/p4lang-
 http://download.opensuse.org/repositories/home:/p4lang/Debian_11/p4lang-pi_0.1.1-1.debian.tar.xz==f293c42988ba76441a90a8b448544ceb
 http://download.opensuse.org/repositories/home:/p4lang/Debian_11/p4lang-pi_0.1.1-1.dsc==c30a016b8bec96730562784cb15b6e4a
 http://download.opensuse.org/repositories/home:/p4lang/Debian_11/p4lang-pi_0.1.1.orig.tar.gz==17a6b9ce972e7666690ebe398dce7f63
+http://download.opensuse.org/repositories/home:/p4lang/Debian_11/p4lang-pi_0.1.3-2.debian.tar.xz==c4f4c43714cf0d226c605a9cfaba3d0b
+http://download.opensuse.org/repositories/home:/p4lang/Debian_11/p4lang-pi_0.1.3-2.dsc==edb9e0d93d51d322676e230db212c9cb
+http://download.opensuse.org/repositories/home:/p4lang/Debian_11/p4lang-pi_0.1.3.orig.tar.gz==f7cff5c6a848e34c474d35b72c017a7f
 http://www.mellanox.com/downloads/MFT/mft-4.36.0-1033-x86_64-deb.tgz==c6054cadaf7f5cd8c2dcbdc516992a30
 http://www.mellanox.com/downloads/MFT/mft-4.36.0-147-aarch64-deb.tgz==29a17968baf6f861e9ce92145b944e61
 https://api.github.com/repos/fullstorydev/grpcurl/releases/latest==d615faa50154a8287c340652045cbd55

@@ -143,7 +143,7 @@ def build(args):
         "BUILD_HOSTNAME": "sonic-bazel-local",
         "SONIC_DPKG_CACHE_METHOD": "none", "SONIC_DPKG_CACHE_METHOD_OVERRIDE": "none",
         "SONIC_DPKG_CACHE_SOURCE": str(native_state / "native-cache"),
-        "SONIC_VERSION_CACHE_METHOD": "none",
+        "SONIC_VERSION_CACHE_METHOD": "rcache",
         "SONIC_VERSION_CACHE_SOURCE": str(native_state / "native-cache/vcache"),
     }
     configured = (native / ".platform").is_file() and (native / ".platform").read_text().strip() == "vs"
