@@ -1,0 +1,16 @@
+diff --git a/proto/tests/server/utils.h b/proto/tests/server/utils.h
+--- a/proto/tests/server/utils.h
++++ b/proto/tests/server/utils.h
+@@ -44,3 +44,3 @@ class TestServer {
+   std::string bind_addr() const {
+-    return std::string("0.0.0.0:") + std::to_string(server_port);
++    return std::string("localhost:") + std::to_string(server_port);
+   }
+diff --git a/proto/tests/server/test_gnmi.cpp b/proto/tests/server/test_gnmi.cpp
+--- a/proto/tests/server/test_gnmi.cpp
++++ b/proto/tests/server/test_gnmi.cpp
+@@ -72,3 +72,3 @@ class GnmiServer {
+   std::string bind_addr() const {
+-    return std::string("0.0.0.0:") + std::to_string(server_port);
++    return std::string("localhost:") + std::to_string(server_port);
+   }
