@@ -33,6 +33,20 @@ set -x -e
 CONFIGURED_ARCH=$([ -f .arch ] && cat .arch || echo amd64)
 CONFIGURED_PLATFORM=$([ -f .platform ] && cat .platform || echo generic)
 
+case "${SONIC_BAZEL_BUILD_STAGE:-}" in
+    "") ;;
+    host|image)
+        if [[ "$CONFIGURED_ARCH" != amd64 || "$CONFIGURED_PLATFORM" != vs || "$TARGET_MACHINE" != vs ]]; then
+            echo "Error: Bazel extension stages support only VS on amd64" >&2
+            exit 1
+        fi
+        ;;
+    *)
+        echo "Error: invalid SONIC_BAZEL_BUILD_STAGE; expected host or image" >&2
+        exit 1
+        ;;
+esac
+
 . functions.sh
 BUILD_SCRIPTS_DIR=files/build_scripts
 BUILD_TEMPLATES=files/build_templates
@@ -66,15 +80,21 @@ clean_sys() {
 trap_push clean_sys
 sudo LANG=C chroot $FILESYSTEM_ROOT mount sysfs /sys -t sysfs
 
-sudo bash -c "echo \"DOCKER_OPTS=\"--storage-driver=overlay2\"\" >> $FILESYSTEM_ROOT/etc/default/docker"
-# Copy docker start script to be able to start docker in chroot
-sudo mkdir -p "$FILESYSTEM_ROOT/$DOCKER_CTL_DIR"
-sudo cp $DOCKER_SCRIPTS_DIR/docker "$FILESYSTEM_ROOT/$DOCKER_CTL_SCRIPT"
-if [[ $MULTIARCH_QEMU_ENVIRON == y  || $CROSS_BUILD_ENVIRON == y ]]; then
-    DOCKER_HOST="unix:///dockerfs/var/run/docker.sock"
-    SONIC_NATIVE_DOCKERD_FOR_DOCKERFS_PID="cat `pwd`/dockerfs/var/run/docker.pid"
-else
-    sudo chroot $FILESYSTEM_ROOT $DOCKER_CTL_SCRIPT start
+if [[ $SONIC_BAZEL_BUILD_STAGE != image ]]; then
+    sudo bash -c "echo \"DOCKER_OPTS=\"--storage-driver=overlay2\"\" >> $FILESYSTEM_ROOT/etc/default/docker"
+    # Copy docker start script to be able to start docker in chroot
+    sudo mkdir -p "$FILESYSTEM_ROOT/$DOCKER_CTL_DIR"
+    sudo cp $DOCKER_SCRIPTS_DIR/docker "$FILESYSTEM_ROOT/$DOCKER_CTL_SCRIPT"
+fi
+# The host snapshot has no container store. Its image stage starts dockerd
+# after restoration; all pre-boundary host work is independent of Docker.
+if [[ $SONIC_BAZEL_BUILD_STAGE != host ]]; then
+    if [[ $MULTIARCH_QEMU_ENVIRON == y  || $CROSS_BUILD_ENVIRON == y ]]; then
+        DOCKER_HOST="unix:///dockerfs/var/run/docker.sock"
+        SONIC_NATIVE_DOCKERD_FOR_DOCKERFS_PID="cat `pwd`/dockerfs/var/run/docker.pid"
+    else
+        sudo chroot $FILESYSTEM_ROOT $DOCKER_CTL_SCRIPT start
+    fi
 fi
 
 install_pip_package() {
@@ -111,6 +131,9 @@ install_deb_package_lazy() {
         sudo LANG=C DEBIAN_FRONTEND=noninteractive chroot $FILESYSTEM_ROOT apt-get -y install -f --download-only
     ( cd $FILESYSTEM_ROOT; sudo rm -f $basename_deb_packages )
 }
+
+# Host work before the restorable container boundary.
+if [[ $SONIC_BAZEL_BUILD_STAGE != image ]]; then
 
 # Update apt's snapshot of its repos
 sudo LANG=C DEBIAN_FRONTEND=noninteractive chroot $FILESYSTEM_ROOT apt-get update
@@ -975,6 +998,13 @@ sudo tee -a $FILESYSTEM_ROOT/etc/modules-load.d/modules.conf > /dev/null <<EOF
 mpls_router
 EOF
 {% endif %}
+
+fi
+
+if [[ $SONIC_BAZEL_BUILD_STAGE == host ]]; then
+    echo '[INFO] Host extension reached the Bazel container boundary'
+    exit 0
+fi
 
 ## Bind docker path
 if [[ $MULTIARCH_QEMU_ENVIRON == y || $CROSS_BUILD_ENVIRON == y ]]; then

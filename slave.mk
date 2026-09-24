@@ -1649,6 +1649,17 @@ $(addprefix $(TARGET_PATH)/, $(SONIC_RFS_TARGETS)) : $(TARGET_PATH)/% : \
 	$(FOOTER)
 
 # targets for building installers with base image
+define SONIC_INSTALLER_TEMPLATE_CLEANUP
+$(foreach docker,$($(1)_DOCKERS),
+	rm -f -- "$($(docker:-dbg.gz=.gz)_CONTAINER_NAME).sh"
+	$(if $($(docker:-dbg.gz=.gz)_MACHINE),rm -f -- "$($(docker:-dbg.gz=.gz)_MACHINE)_$($(docker:-dbg.gz=.gz)_CONTAINER_NAME).sh")
+	rm -f -- "$($(docker:-dbg.gz=.gz)_CONTAINER_NAME).service"
+	rm -f -- "$($(docker:-dbg.gz=.gz)_CONTAINER_NAME)@.service"
+	rm -f -- "$($(docker:-dbg.gz=.gz)_CONTAINER_NAME)-chassis.service"
+)
+$(if $($(1)_DOCKERS),rm -f -- sonic_debian_extension.sh)
+endef
+
 $(addprefix $(TARGET_PATH)/, $(SONIC_INSTALLERS)) : private export PASSWORD := $(PASSWORD)
 $(addprefix $(TARGET_PATH)/, $(SONIC_INSTALLERS)) : private export BMC_ROOT_ACCOUNT_DEFAULT_PASSWORD := $(BMC_ROOT_ACCOUNT_DEFAULT_PASSWORD)
 $(addprefix $(TARGET_PATH)/, $(SONIC_INSTALLERS)) : $(TARGET_PATH)/% : \
@@ -1726,6 +1737,28 @@ $(addprefix $(TARGET_PATH)/, $(SONIC_INSTALLERS)) : $(TARGET_PATH)/% : \
         $(addprefix $(PYTHON_WHEELS_PATH)/,$(SONIC_HOST_SERVICES_PY3)) \
         $$(addprefix $(TARGET_PATH)/,$$($$*_RFS_DEPENDS)) \
         $(addprefix $(IMAGE_DISTRO_DEBS_PATH)/,$(LINUX_KBUILD)-install)
+
+	# Set stage variables after prerequisites complete. Target-specific exported
+	# variables can reach prerequisite shells even with Make's private modifier.
+	if [[ -n "$${SONIC_BAZEL_REQUESTED_STAGE:-}" ]]; then
+		export SONIC_BAZEL_BUILD_STAGE="$${SONIC_BAZEL_REQUESTED_STAGE}"
+		export SONIC_BAZEL_IMAGE_STAGE=""
+		case "$${SONIC_BAZEL_REQUESTED_STAGE}" in onie|kvm) export SONIC_BAZEL_IMAGE_STAGE="$${SONIC_BAZEL_REQUESTED_STAGE}" ;; esac
+	fi
+	if [[ -n "$${SONIC_BAZEL_BUILD_STAGE:-}" ]]; then
+		case "$${SONIC_BAZEL_BUILD_STAGE}" in prepare|host|image|onie|kvm) ;; *) echo "Invalid SONIC_BAZEL_BUILD_STAGE" >&2; exit 2 ;; esac
+		if [[ "$(CONFIGURED_PLATFORM)" != vs || "$(CONFIGURED_ARCH)" != amd64 || "$(BLDENV)" != trixie ]]; then
+			echo "Bazel image stages require the amd64 Trixie VS configuration" >&2
+			exit 2
+		fi
+		if [[ "$(ENABLE_SBOM)" == y || -n "$($*_POST_BUILD_HOOK)" ]]; then
+			echo "Bazel image stages do not yet support SBOM emission or installer post-build hooks" >&2
+			exit 2
+		fi
+	fi
+	if [[ "$${SONIC_BAZEL_BUILD_STAGE:-}" == prepare ]]; then
+		exit 0
+	fi
 
 	$(HEADER)
 	# Pass initramfs and linux kernel explicitly. They are used for all platforms
@@ -1907,6 +1940,7 @@ $(addprefix $(TARGET_PATH)/, $(SONIC_INSTALLERS)) : $(TARGET_PATH)/% : \
 		DEBUG_SRC_ARCHIVE_FILE="$(DBG_SRC_ARCHIVE_FILE)" \
 			scripts/dbg_files.sh
 
+		if [[ "$${SONIC_BAZEL_BUILD_STAGE:-}" != onie && "$${SONIC_BAZEL_BUILD_STAGE:-}" != kvm ]]; then
 		RFS_SQUASHFS_NAME=$*__$(dep_machine)__rfs.squashfs \
 		DEBUG_IMG="$(INSTALL_DEBUG_TOOLS)" \
 		DEBUG_SRC_ARCHIVE_FILE="$(DBG_SRC_ARCHIVE_FILE)" \
@@ -1939,6 +1973,13 @@ $(addprefix $(TARGET_PATH)/, $(SONIC_INSTALLERS)) : $(TARGET_PATH)/% : \
 		ENABLE_SBOM="$(ENABLE_SBOM)" \
 		TARGET_PATH="$(TARGET_PATH)" \
 			./build_debian.sh $(LOG)
+		fi
+
+		if [[ "$${SONIC_BAZEL_BUILD_STAGE:-}" == host || "$${SONIC_BAZEL_BUILD_STAGE:-}" == image ]]; then
+			$(call SONIC_INSTALLER_TEMPLATE_CLEANUP,$*)
+			$(FOOTER)
+			exit 0
+		fi
 
 		USERNAME="$(USERNAME)" \
 		PASSWORD="$${PASSWORD}" \
@@ -1959,6 +2000,19 @@ $(addprefix $(TARGET_PATH)/, $(SONIC_INSTALLERS)) : $(TARGET_PATH)/% : \
 		CA_CERT="$(CA_CERT)" \
 		TARGET_PATH="$(TARGET_PATH)" \
 			./build_image.sh $(LOG)
+
+		if [[ "$${SONIC_BAZEL_BUILD_STAGE:-}" == onie || "$${SONIC_BAZEL_BUILD_STAGE:-}" == kvm ]]; then
+			$(call SONIC_INSTALLER_TEMPLATE_CLEANUP,$*)
+			rm -rf -- installer/platforms
+			rm -f -- installer/platforms_asic
+			if [[ "$${SONIC_BAZEL_BUILD_STAGE}" == onie ]]; then
+				chmod a+x "$(TARGET_PATH)/sonic-vs.bin"
+			else
+				chmod a+x "$@"
+			fi
+			$(FOOTER)
+			exit 0
+		fi
 
 		printf '%s\n' $${installer_images} | \
 			awk -F'|' -v machine="$(dep_machine)" \
@@ -1997,15 +2051,7 @@ $(addprefix $(TARGET_PATH)/, $(SONIC_INSTALLERS)) : $(TARGET_PATH)/% : \
 			./scripts/build_sbom.sh $(LOG)
 	)
 
-	$(foreach docker, $($*_DOCKERS), \
-		rm -f *$($(docker:-dbg.gz=.gz)_CONTAINER_NAME).sh
-		rm -f $($(docker:-dbg.gz=.gz)_CONTAINER_NAME).service
-		rm -f $($(docker:-dbg.gz=.gz)_CONTAINER_NAME)@.service
-	)
-
-	$(if $($*_DOCKERS),
-		rm sonic_debian_extension.sh,
-	)
+	$(call SONIC_INSTALLER_TEMPLATE_CLEANUP,$*)
 
 	# Provide a hook that modules may use for post-build activities
 	$(if $($*_POST_BUILD_HOOK), \
@@ -2016,6 +2062,13 @@ $(addprefix $(TARGET_PATH)/, $(SONIC_INSTALLERS)) : $(TARGET_PATH)/% : \
 	$(FOOTER)
 
 SONIC_TARGET_LIST += $(addprefix $(TARGET_PATH)/, $(SONIC_INSTALLERS))
+
+# Enter the Bazel driver through Makefile.work's normal sonic-slave command so
+# inventory, preparation and cached actions share the evaluated configuration.
+.PHONY: bazel-driver
+bazel-driver: export SONIC_BAZEL_COMMAND_VARIABLES := $(sort $(foreach variable,$(.VARIABLES),$(if $(findstring command line,$(origin $(variable))),$(variable))))
+bazel-driver: .platform
+	python3 scripts/bazel/driver.py --request target/bazel/request.json
 
 ###############################################################################
 ## Clean targets

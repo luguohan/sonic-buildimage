@@ -64,12 +64,95 @@ TRUSTED_GPG_DIR=$BUILD_TOOL_PATH/trusted.gpg.d
     exit 1
 }
 
+# Bazel uses a restorable host snapshot immediately before container loading.
+# Keep this opt-in so the normal native build follows its existing path.
+SONIC_BAZEL_SNAPSHOT_HELPER=scripts/bazel/native/host_snapshot.py
+SONIC_BAZEL_STATE_FILE=.sonic-bazel-host-state.json
+SONIC_BAZEL_STATE_FIELDS=(build_version debian_version kernel_version asic_type asic_subtype commit_id branch release build_date build_number built_by sonic_os_version)
+case "${SONIC_BAZEL_BUILD_STAGE:-}" in
+    "") ;;
+    host|image)
+        [[ "$SONIC_BAZEL_HOST_SNAPSHOT" == /* ]] || die "SONIC_BAZEL_HOST_SNAPSHOT must be an absolute path"
+        [[ "$CONFIGURED_ARCH" == amd64 && "$CONFIGURED_PLATFORM" == vs && "$TARGET_MACHINE" == vs ]] || die "Bazel host snapshots support only VS on amd64"
+        [[ "$IMAGE_TYPE" == onie || "$IMAGE_TYPE" == kvm ]] || die "Bazel host snapshots require IMAGE_TYPE=onie or kvm"
+        [[ -n "$IMAGE_DISTRO" && -n "$SONIC_IMAGE_VERSION" ]] || die "Bazel host snapshots require IMAGE_DISTRO and SONIC_IMAGE_VERSION"
+        [[ "$SONIC_BAZEL_SOURCE_COMMIT" =~ ^[0-9a-fA-F]{7,64}$ ]] || die "Bazel host snapshots require SONIC_BAZEL_SOURCE_COMMIT as a hexadecimal Git commit"
+        [[ -n "$SONIC_BAZEL_SOURCE_BRANCH" && "$SONIC_BAZEL_SOURCE_BRANCH" != *$'\n'* ]] || die "Bazel host snapshots require SONIC_BAZEL_SOURCE_BRANCH"
+        [[ "$SOURCE_DATE_EPOCH" =~ ^[0-9]+$ ]] || die "Bazel host snapshots require SOURCE_DATE_EPOCH"
+        [[ "${RFS_SPLIT_FIRST_STAGE:-n}" == n ]] || die "Bazel host snapshots require RFS_SPLIT_FIRST_STAGE=n or unset"
+        [[ "${RFS_SPLIT_LAST_STAGE:-n}" == y || "${RFS_SPLIT_LAST_STAGE:-n}" == n ]] || die "Invalid RFS_SPLIT_LAST_STAGE for a Bazel host snapshot"
+        [[ "${MULTIARCH_QEMU_ENVIRON:-n}" == n && "${CROSS_BUILD_ENVIRON:-n}" == n ]] || die "Bazel host snapshots do not support cross or multiarch builds"
+        [[ -x sonic_debian_extension.sh ]] || die "Bazel host snapshots require the rendered sonic_debian_extension.sh"
+        sonic_bazel_root_path=$(realpath -m "$FILESYSTEM_ROOT")
+        sonic_bazel_snapshot_path=$(realpath -m "$SONIC_BAZEL_HOST_SNAPSHOT")
+        case "$sonic_bazel_snapshot_path" in
+            "$sonic_bazel_root_path"|"$sonic_bazel_root_path"/*) die "The Bazel host snapshot must be outside the host root" ;;
+        esac
+        SONIC_BAZEL_IDENTITY_ARGS=(--arch "$CONFIGURED_ARCH" --platform "$CONFIGURED_PLATFORM" --machine "$TARGET_MACHINE" --image-type "$IMAGE_TYPE" --distro "$IMAGE_DISTRO" --image-version "$SONIC_IMAGE_VERSION" --source-commit "$SONIC_BAZEL_SOURCE_COMMIT" --source-branch "$SONIC_BAZEL_SOURCE_BRANCH" --source-date-epoch "$SOURCE_DATE_EPOCH")
+        if [[ "$SONIC_BAZEL_BUILD_STAGE" == image ]]; then
+            [[ -r "$SONIC_BAZEL_HOST_SNAPSHOT" ]] || die "Bazel host snapshot is not readable"
+            unsquashfs -s "$SONIC_BAZEL_HOST_SNAPSHOT" > /dev/null
+        else
+            sudo python3 "$SONIC_BAZEL_SNAPSHOT_HELPER" assert-clean "$FILESYSTEM_ROOT"
+        fi
+        ;;
+    *) die "Invalid SONIC_BAZEL_BUILD_STAGE; expected host or image" ;;
+esac
+
+sonic_bazel_write_host_snapshot()
+(
+    set -e
+    local state_tmp="" snapshot_tmp=""
+    cleanup_snapshot_files()
+    {
+        [[ -z "$state_tmp" ]] || rm -f -- "$state_tmp"
+        [[ -z "$snapshot_tmp" ]] || sudo rm -f -- "$snapshot_tmp"
+        sudo rm -f -- "$FILESYSTEM_ROOT/$SONIC_BAZEL_STATE_FILE"
+    }
+    trap cleanup_snapshot_files EXIT
+
+    sudo python3 "$SONIC_BAZEL_SNAPSHOT_HELPER" quiesce "$FILESYSTEM_ROOT"
+    # A package post-install daemon may have left runtime files even after it
+    # stopped. The image stage starts a new daemon for this restored root.
+    sudo chroot "$FILESYSTEM_ROOT" rm -rf -- /run/docker /run/containerd /run/docker.pid /run/docker-ssd.pid /run/docker.sock
+    state_tmp=$(mktemp)
+    python3 "$SONIC_BAZEL_SNAPSHOT_HELPER" write-state "$state_tmp" "${SONIC_BAZEL_IDENTITY_ARGS[@]}"
+    sudo install -m 0644 "$state_tmp" "$FILESYSTEM_ROOT/$SONIC_BAZEL_STATE_FILE"
+    snapshot_tmp=$(mktemp "${SONIC_BAZEL_HOST_SNAPSHOT}.tmp.XXXXXX")
+    rm -f -- "$snapshot_tmp"
+    sudo mksquashfs "$FILESYSTEM_ROOT" "$snapshot_tmp" -comp zstd -b 1M -noappend
+    sudo chown "$(id -u):$(id -g)" "$snapshot_tmp"
+    mv -f -- "$snapshot_tmp" "$SONIC_BAZEL_HOST_SNAPSHOT"
+)
+
+sonic_bazel_restore_host_snapshot()
+{
+    local state_tmp state_index
+    local -a state_values
+    sudo python3 "$SONIC_BAZEL_SNAPSHOT_HELPER" assert-clean "$FILESYSTEM_ROOT"
+    sudo rm -rf -- "$FILESYSTEM_ROOT"
+    sudo unsquashfs -d "$FILESYSTEM_ROOT" "$SONIC_BAZEL_HOST_SNAPSHOT"
+    state_tmp=$(mktemp)
+    if ! python3 "$SONIC_BAZEL_SNAPSHOT_HELPER" read-state "$FILESYSTEM_ROOT/$SONIC_BAZEL_STATE_FILE" "${SONIC_BAZEL_IDENTITY_ARGS[@]}" > "$state_tmp"; then
+        rm -f -- "$state_tmp"
+        return 1
+    fi
+    mapfile -d '' -t state_values < "$state_tmp"
+    rm -f -- "$state_tmp"
+    [[ ${#state_values[@]} == ${#SONIC_BAZEL_STATE_FIELDS[@]} ]] || die "Bazel host snapshot has an incomplete state record"
+    for state_index in "${!SONIC_BAZEL_STATE_FIELDS[@]}"; do
+        printf -v "${SONIC_BAZEL_STATE_FIELDS[$state_index]}" '%s' "${state_values[$state_index]}"
+        export "${SONIC_BAZEL_STATE_FIELDS[$state_index]}"
+    done
+    sudo rm -f -- "$FILESYSTEM_ROOT/$SONIC_BAZEL_STATE_FILE"
+}
+
 if [ "$IMAGE_TYPE" = "aboot" ]; then
     TARGET_BOOTLOADER="aboot"
 fi
 
 ## Check if not a last stage of RFS build
-if [[ $RFS_SPLIT_LAST_STAGE != y ]]; then
+if [[ $RFS_SPLIT_LAST_STAGE != y && $SONIC_BAZEL_BUILD_STAGE != image ]]; then
 
 ## Prepare the file system directory
 if [[ -d $FILESYSTEM_ROOT ]]; then
@@ -657,7 +740,11 @@ if [[ $RFS_SPLIT_FIRST_STAGE == y ]]; then
     exit 0
 fi
 
-if [[ $RFS_SPLIT_LAST_STAGE == y ]]; then
+if [[ $SONIC_BAZEL_BUILD_STAGE == image ]]; then
+    echo '[INFO] Restoring Bazel host snapshot'
+    sudo mount proc /proc -t proc || true
+    sonic_bazel_restore_host_snapshot
+elif [[ $RFS_SPLIT_LAST_STAGE == y ]]; then
     echo '[INFO] RFS build: second stage'
 
     ## ensure proc is mounted
@@ -666,7 +753,9 @@ if [[ $RFS_SPLIT_LAST_STAGE == y ]]; then
     sudo fuser -vm $FILESYSTEM_ROOT || true
     sudo rm -rf $FILESYSTEM_ROOT
     sudo unsquashfs -d $FILESYSTEM_ROOT $TARGET_PATH/$RFS_SQUASHFS_NAME
+fi
 
+if [[ $RFS_SPLIT_LAST_STAGE == y || $SONIC_BAZEL_BUILD_STAGE == image ]]; then
     ## make / as a mountpoint in chroot env, needed by dockerd
     pushd $FILESYSTEM_ROOT
     sudo mount --bind . .
@@ -677,22 +766,40 @@ if [[ $RFS_SPLIT_LAST_STAGE == y ]]; then
 fi
 
 ## Version file part 2
+if [[ $SONIC_BAZEL_BUILD_STAGE != image ]]; then
 export build_version="${SONIC_IMAGE_VERSION}"
 export debian_version="$(cat $FILESYSTEM_ROOT/etc/debian_version)"
 export kernel_version="${kversion}"
 export asic_type="${sonic_asic_platform}"
 export asic_subtype="${TARGET_MACHINE}"
-export commit_id="$(git rev-parse --short HEAD)"
-export branch="$(git rev-parse --abbrev-ref HEAD)"
+if [[ -n $SONIC_BAZEL_BUILD_STAGE ]]; then
+    export commit_id="$SONIC_BAZEL_SOURCE_COMMIT"
+    export branch="$SONIC_BAZEL_SOURCE_BRANCH"
+else
+    export commit_id="$(git rev-parse --short HEAD)"
+    export branch="$(git rev-parse --abbrev-ref HEAD)"
+fi
 export release="$(if [ -f $FILESYSTEM_ROOT/etc/sonic/sonic_release ]; then cat $FILESYSTEM_ROOT/etc/sonic/sonic_release; fi)"
-export build_date="$(date -u)"
+if [[ -n $SONIC_BAZEL_BUILD_STAGE ]]; then
+    build_date=$(LC_ALL=C date -u -d "@$SOURCE_DATE_EPOCH")
+    export build_date
+else
+    export build_date="$(date -u)"
+fi
 export build_number="${BUILD_NUMBER:-0}"
 export built_by="$USER@$BUILD_HOSTNAME"
 export sonic_os_version="${SONIC_OS_VERSION}"
 j2 files/build_templates/sonic_version.yml.j2 | sudo tee $FILESYSTEM_ROOT/etc/sonic/sonic_version.yml
+fi
 
 if [ -f sonic_debian_extension.sh ]; then
     ./sonic_debian_extension.sh $FILESYSTEM_ROOT $PLATFORM_DIR $IMAGE_DISTRO
+fi
+
+if [[ $SONIC_BAZEL_BUILD_STAGE == host ]]; then
+    echo '[INFO] Saving Bazel host snapshot before container loading'
+    sonic_bazel_write_host_snapshot
+    exit 0
 fi
 
 ## Organization specific extensions such as Configuration & Scripts for features like AAA, ZTP...

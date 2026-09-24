@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""Prepare the public SONiC build environment and build a local Bazel target."""
+
+import argparse
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+import native_action
+import source_snapshot
+
+
+ROOT = Path(__file__).resolve().parents[2]
+STATE = ROOT / "target/bazel"
+
+
+def output(command, cwd=ROOT, env=None):
+    environment = dict(os.environ if env is None else env)
+    environment["PWD"] = str(Path(cwd).resolve())
+    return subprocess.check_output(command, cwd=cwd, env=environment, text=True).strip()
+
+
+def run(command, cwd=ROOT, env=None):
+    print("+ " + " ".join(command[:6]) + (" ..." if len(command) > 6 else ""), flush=True)
+    environment = dict(os.environ if env is None else env)
+    environment["PWD"] = str(Path(cwd).resolve())
+    subprocess.run(command, cwd=cwd, env=environment, check=True)
+
+
+def write_json(path, value, mode=0o644):
+    data = json.dumps(value, indent=2, sort_keys=True) + "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists() or path.read_text() != data:
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(data)
+        temporary.chmod(mode)
+        temporary.replace(path)
+    else:
+        path.chmod(mode)
+
+
+def sync_swss(source, state):
+    source = source.resolve()
+    if not (source / "configure.ac").is_file() or not (source / "debian/rules").is_file():
+        raise RuntimeError("--swss-source must name a sonic-swss checkout")
+    commit = output(["git", "rev-parse", "HEAD"], source)
+    branch = output(["git", "rev-parse", "--abbrev-ref", "HEAD"], source)
+    encoded = subprocess.check_output(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"], cwd=source
+    )
+    names = sorted({os.fsdecode(item) for item in encoded.split(b"\0") if item})
+    state.mkdir(parents=True, exist_ok=True)
+    destination = state / "swss-source"
+    if destination.exists() and not (destination / ".sonic-bazel-source").is_file():
+        raise RuntimeError("refusing to replace an unowned SWSS staging directory")
+    previous = state / ".swss-source.previous"
+    if previous.exists():
+        raise RuntimeError("a previous SWSS staging replacement needs cleanup: " + str(previous))
+    temporary = Path(tempfile.mkdtemp(prefix=".swss-source-", dir=state))
+    (temporary / ".sonic-bazel-source").touch()
+    entries = {name: native_action.source_entry(source, name) for name in names}
+    try:
+        for name in names:
+            path = source / name
+            if entries[name]["kind"] == "missing":
+                continue
+            source_snapshot.copy_source_file(path, temporary / name, source, temporary)
+        current_encoded = subprocess.check_output(
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"], cwd=source,
+        )
+        current_names = sorted({os.fsdecode(item) for item in current_encoded.split(b"\0") if item})
+        current_entries = {name: native_action.source_entry(source, name) for name in current_names}
+        current_commit = output(["git", "rev-parse", "HEAD"], source)
+        current_branch = output(["git", "rev-parse", "--abbrev-ref", "HEAD"], source)
+        if current_entries != entries or current_commit != commit or current_branch != branch:
+            raise RuntimeError("SWSS sources changed while staging; rerun scripts/bazel/run")
+        staged_entries = {name: native_action.source_entry(temporary, name) for name in names}
+        expected_entries = {
+            name: source_snapshot.expected_staged_entry(entry, name, source, temporary)
+            for name, entry in entries.items()
+        }
+        if staged_entries != expected_entries:
+            raise RuntimeError("the staged SWSS source bytes do not match the selected checkout")
+        if destination.exists():
+            destination.rename(previous)
+        try:
+            temporary.rename(destination)
+        except BaseException:
+            if previous.exists():
+                previous.rename(destination)
+            raise
+        if previous.exists():
+            shutil.rmtree(previous)
+    finally:
+        shutil.rmtree(temporary, ignore_errors=True)
+    identity = {"commit": commit, "branch": branch, "entries": entries}
+    identity["digest"] = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+    write_json(state / "swss-source.json", identity)
+    return identity
+
+
+def make_command(target, variables):
+    return ["make", "-f", "Makefile.work", "BLDENV=trixie"] + [
+        name + "=" + str(value) for name, value in variables.items()
+    ] + [target]
+
+
+def build(args):
+    source = args.swss_source
+    if source is None:
+        sibling = ROOT.parent / "sonic-swss"
+        source = sibling if (sibling / "configure.ac").is_file() else ROOT / "src/sonic-swss"
+    if not (source / "bazel/generate.py").is_file():
+        raise RuntimeError("the selected sonic-swss checkout needs the Bazel package implementation")
+    source_snapshot.ensure_submodules(ROOT)
+    native = source_snapshot.stage_checkout(ROOT, STATE)
+    native_state = native / "target/bazel"
+    swss = sync_swss(source, native_state)
+    commit = output(["git", "rev-parse", "HEAD"])
+    branch = output(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+    epoch = int(output(["git", "show", "-s", "--format=%ct", "HEAD"]))
+    timestamp = datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime("%Y%m%d.%H%M%S")
+    stamp_environment = os.environ.copy()
+    stamp_environment.update({"BUILD_TIMESTAMP": timestamp, "BUILD_NUMBER": "0"})
+    version = output(["bash", "-c", ". functions.sh; sonic_get_version"], env=stamp_environment)
+    variables = {
+        "PLATFORM": "vs", "PLATFORM_ARCH": "amd64", "SONIC_BUILD_JOBS": args.jobs,
+        "SONIC_CONFIG_MAKE_JOBS": args.jobs, "BUILD_NUMBER": "0",
+        "BUILD_TIMESTAMP": timestamp, "SONIC_IMAGE_VERSION": version,
+        "SOURCE_DATE_EPOCH": epoch,
+        "BUILD_HOSTNAME": "sonic-bazel-local",
+        "SONIC_DPKG_CACHE_METHOD": "none", "SONIC_DPKG_CACHE_METHOD_OVERRIDE": "none",
+        "SONIC_VERSION_CACHE_METHOD": "none",
+    }
+    configured = (native / ".platform").is_file() and (native / ".platform").read_text().strip() == "vs"
+    configured = configured and (native / ".arch").is_file() and (native / ".arch").read_text().strip() == "amd64"
+    if not configured:
+        run(make_command("configure", variables), cwd=native)
+    run(make_command("sonic-slave-build", variables), cwd=native)
+    tag_output = output(make_command("showtag", variables), cwd=native)
+    tags = [line for line in tag_output.splitlines() if re.fullmatch(r"[A-Za-z0-9_./-]+:[A-Za-z0-9_.-]+", line)]
+    if not tags:
+        raise RuntimeError("could not determine the public Trixie slave image tag")
+    image_id = output(["docker", "image", "inspect", "--format={{.Id}}", tags[-1]])
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
+        raise RuntimeError("could not determine the immutable Trixie slave image identity")
+    request = {
+        "schema": 1, "target": args.target, "jobs": args.jobs,
+        "bazel_args": args.bazel_arg, "reprepare": args.reprepare,
+        "source_commit": commit, "source_branch": branch, "source_date_epoch": epoch,
+        "swss_commit": swss["commit"], "swss_digest": swss["digest"],
+        "slave_image_id": image_id, "make_variables": variables,
+        "native_source_input_digest": json.loads((STATE / "native-source-input.json").read_text())["digest"],
+    }
+    for phase in ("prepare", "build"):
+        request["phase"] = phase
+        write_json(native_state / "request.json", request)
+        run(make_command("bazel-driver", variables), cwd=native)
+    print("Local Bazel artifacts: " + str(native_state / "artifacts" / args.target), flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("target", choices=("swss", "container", "vs", "vs-kvm"))
+    parser.add_argument("--swss-source", type=Path)
+    parser.add_argument("--jobs", type=int, default=4)
+    parser.add_argument("--bazel-arg", action="append", default=[])
+    parser.add_argument("--reprepare", action="store_true", help="recheck native prerequisite builds")
+    args = parser.parse_args()
+    if args.jobs < 1:
+        parser.error("--jobs must be positive")
+    for tool in ("git", "make", "docker", "j2"):
+        if not shutil.which(tool):
+            raise RuntimeError("missing host tool " + tool + ("; install jinjanator to provide j2" if tool == "j2" else ""))
+    STATE.mkdir(parents=True, exist_ok=True)
+    with (STATE / "launcher.lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        build(args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, RuntimeError, subprocess.CalledProcessError, ValueError) as error:
+        print("SONiC Bazel: " + str(error), file=sys.stderr)
+        sys.exit(1)

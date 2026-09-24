@@ -30,6 +30,28 @@ fi
     exit 1
 }
 
+case "${SONIC_BAZEL_IMAGE_STAGE:-}" in
+    "") ;;
+    onie|kvm)
+        if [[ "$CONFIGURED_ARCH" != amd64 || "$CONFIGURED_PLATFORM" != vs || "$TARGET_MACHINE" != vs ]]; then
+            echo "Error: Bazel installer stages support only VS on amd64" >&2
+            exit 1
+        fi
+        if [[ "$IMAGE_TYPE" != onie && "$IMAGE_TYPE" != kvm ]]; then
+            echo "Error: Bazel installer stages require IMAGE_TYPE=onie or kvm" >&2
+            exit 1
+        fi
+        if [[ "$SONIC_BAZEL_IMAGE_STAGE" == kvm && "$IMAGE_TYPE" != kvm ]]; then
+            echo "Error: the Bazel kvm stage requires IMAGE_TYPE=kvm" >&2
+            exit 1
+        fi
+        ;;
+    *)
+        echo "Error: invalid SONIC_BAZEL_IMAGE_STAGE; expected onie or kvm" >&2
+        exit 1
+        ;;
+esac
+
 IMAGE_VERSION="${SONIC_IMAGE_VERSION}"
 
 generate_kvm_image()
@@ -50,7 +72,8 @@ generate_kvm_image()
 
     echo "Build $NUM_ASIC-asic ${BOOT_FIRMWARE} KVM image"
     if [[ "$BOOT_FIRMWARE" == "UEFI" ]]; then
-        KVM_IMAGE_DISK=${KVM_IMAGE%.img.gz}-uefi.img
+        KVM_IMAGE_DISK=${KVM_IMAGE%.gz}
+        KVM_IMAGE_DISK=${KVM_IMAGE_DISK%.img}-uefi.img
     else
         KVM_IMAGE_DISK=${KVM_IMAGE%.gz}
     fi
@@ -138,7 +161,32 @@ generate_device_list()
     fi
 }
 
-if [ "$IMAGE_TYPE" = "onie" ]; then
+generate_kvm_images()
+{
+    generate_kvm_image 1
+    if [ "$CONFIGURED_PLATFORM" = "vs" ]; then
+        generate_kvm_image 1 UEFI
+    fi
+    if [ "$BUILD_MULTIASIC_KVM" == "y" ]; then
+        generate_kvm_image 4
+        generate_kvm_image 6
+    fi
+}
+
+if [[ "$SONIC_BAZEL_IMAGE_STAGE" == onie ]]; then
+    echo "Build Bazel ONIE installer stage"
+    mkdir -p "$(dirname "$OUTPUT_ONIE_IMAGE")"
+    sudo rm -f "$OUTPUT_ONIE_IMAGE"
+    generate_device_list "./installer/platforms_asic"
+    generate_onie_installer_image
+elif [[ "$SONIC_BAZEL_IMAGE_STAGE" == kvm ]]; then
+    echo "Build Bazel KVM stage from the existing ONIE installer"
+    if [[ ! -r "$OUTPUT_ONIE_IMAGE" ]]; then
+        echo "Error: the Bazel kvm stage requires $OUTPUT_ONIE_IMAGE" >&2
+        exit 1
+    fi
+    generate_kvm_images
+elif [ "$IMAGE_TYPE" = "onie" ]; then
     echo "Build ONIE installer"
     mkdir -p `dirname $OUTPUT_ONIE_IMAGE`
     sudo rm -f $OUTPUT_ONIE_IMAGE
@@ -190,18 +238,7 @@ elif [ "$IMAGE_TYPE" = "kvm" ]; then
     generate_device_list "./installer/platforms_asic"
 
     generate_onie_installer_image
-    # Generate single asic KVM image
-    generate_kvm_image 1
-    # Generate the UEFI image only for the VS platform.
-    if [ "$CONFIGURED_PLATFORM" = "vs" ]; then
-        generate_kvm_image 1 UEFI
-    fi
-    if [ "$BUILD_MULTIASIC_KVM" == "y" ]; then
-        # Generate 4-asic KVM image
-        generate_kvm_image 4
-        # Generate 6-asic KVM image
-        generate_kvm_image 6
-    fi
+    generate_kvm_images
 
 
 ## Use 'aboot' as target machine category which includes Aboot as bootloader
