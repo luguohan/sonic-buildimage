@@ -14,11 +14,74 @@ import stat
 import subprocess
 import tempfile
 from urllib.parse import urlsplit
+import uuid
 
 import native_action
 
 
 MARKER = ".sonic-bazel-native-source"
+
+
+def read_regular_json(path):
+    if not stat.S_ISREG(path.lstat().st_mode):
+        raise RuntimeError("expected a regular native snapshot state file: " + str(path))
+    value = json.loads(path.read_text())
+    if not isinstance(value, dict):
+        raise RuntimeError("native snapshot state must be a JSON object: " + str(path))
+    return value
+
+
+def write_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(prefix="." + path.name + "-", dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            stream.write(json.dumps(value, indent=2, sort_keys=True) + "\n")
+        temporary.chmod(0o644)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def snapshot_marker_version(checkout):
+    marker = checkout / MARKER
+    try:
+        info = marker.lstat()
+    except FileNotFoundError as error:
+        raise RuntimeError("refusing to replace an unowned native source directory") from error
+    if not stat.S_ISREG(info.st_mode):
+        raise RuntimeError("native source marker must be a regular file")
+    text = marker.read_text()
+    if text == "schema=1\n":
+        return 1
+    try:
+        value = json.loads(text)
+    except ValueError as error:
+        raise RuntimeError("invalid native source marker") from error
+    snapshot_id = value.get("snapshot_id") if isinstance(value, dict) else None
+    valid_schema = isinstance(value, dict) and type(value.get("schema")) is int
+    valid_id = isinstance(snapshot_id, str) and len(snapshot_id) == 32
+    valid_id = valid_id and all(character in "0123456789abcdef" for character in snapshot_id)
+    if not valid_schema or value != {"schema": 2, "snapshot_id": snapshot_id} or not valid_id:
+        raise RuntimeError("invalid native source marker")
+    return 2
+
+
+def write_snapshot_marker(checkout):
+    snapshot_id = uuid.uuid4().hex
+    write_json(checkout / MARKER, {"schema": 2, "snapshot_id": snapshot_id})
+    return snapshot_id
+
+
+def snapshot_identity(checkout, snapshot_id):
+    info = checkout.lstat()
+    identity = {
+        "schema": 1, "snapshot_id": snapshot_id,
+        "device": info.st_dev, "inode": info.st_ino,
+    }
+    native_action.validate_native_snapshot(checkout, identity)
+    return identity
 
 
 def output(command, cwd):
@@ -157,17 +220,10 @@ def clone_repository(source, destination, source_root, destination_root):
         clone_repository(source / name, destination / name, source_root, destination_root)
 
 
-def verify_isolation(checkout):
-    _paths, repositories = native_action.git_sources(checkout, exclude_swss=False)
-    for identity in repositories:
-        repository = checkout if identity["path"] == "." else checkout / identity["path"]
-        common = Path(output(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], repository)).resolve()
-        try:
-            common.relative_to(checkout.resolve())
-        except ValueError as error:
-            raise RuntimeError("native snapshot shares Git state with another checkout") from error
-        if (common / "objects/info/alternates").exists():
-            raise RuntimeError("native snapshot has an external Git object store")
+def verify_isolation(checkout, identity):
+    native_action.git_sources(
+        checkout, exclude_swss=False, context="native", snapshot_identity=identity,
+    )
 
 
 def assert_not_in_use(checkout):
@@ -191,24 +247,32 @@ def stage_checkout(source, state):
     receipt = state / "native-source-input.json"
     snapshot = native_action.source_state(source)
     digest = native_action.digest_bytes(native_action.canonical_json(snapshot))
-    if checkout.exists() and not (checkout / MARKER).is_file():
-        raise RuntimeError("refusing to replace an unowned native source directory")
-    if checkout.exists() and receipt.exists():
-        previous = json.loads(receipt.read_text())
-        if previous.get("schema") == 1 and previous.get("digest") == digest:
-            root_identity = next(item for item in snapshot["repositories"] if item["path"] == ".")
-            current_commit = output(["git", "rev-parse", "HEAD"], checkout)
-            current_branch = output(["git", "rev-parse", "--abbrev-ref", "HEAD"], checkout)
-            current_digest = native_action.digest_bytes(native_action.canonical_json(native_action.source_state(checkout)))
-            approved_path = checkout / "target/bazel/native-source-approved.json"
-            approved = json.loads(approved_path.read_text()) if approved_path.is_file() else {}
-            expected_state = current_digest == previous.get("raw_digest", digest) or (
-                approved.get("schema") == 1 and approved.get("source_input_digest") == digest
-                and approved.get("prepared_digest") == current_digest
-            )
-            if expected_state and current_commit == root_identity["commit"] and current_branch == root_identity["branch"]:
-                verify_isolation(checkout)
-                return checkout
+    if checkout.is_symlink():
+        raise RuntimeError("native source directory must not be a symlink")
+    marker_version = snapshot_marker_version(checkout) if checkout.exists() else None
+    previous = read_regular_json(receipt) if receipt.exists() or receipt.is_symlink() else {}
+    identity = previous.get("snapshot_identity")
+    if marker_version == 2:
+        if previous.get("schema") != 2:
+            raise RuntimeError("native snapshot ownership receipt is missing or unsupported")
+        native_action.validate_native_snapshot(checkout, identity)
+    elif marker_version == 1 and previous.get("schema") == 2:
+        raise RuntimeError("native snapshot marker and ownership receipt disagree")
+    if marker_version == 2 and previous.get("digest") == digest:
+        root_identity = next(item for item in snapshot["repositories"] if item["path"] == ".")
+        current = native_action.source_state(checkout, context="native", snapshot_identity=identity)
+        current_root = next(item for item in current["repositories"] if item["path"] == ".")
+        current_digest = native_action.digest_bytes(native_action.canonical_json(current))
+        approved_path = checkout / "target/bazel/native-source-approved.json"
+        approved = read_regular_json(approved_path) if approved_path.exists() or approved_path.is_symlink() else {}
+        expected_state = current_digest == previous.get("raw_digest", digest) or (
+            approved.get("schema") == 2 and approved.get("source_input_digest") == digest
+            and approved.get("snapshot_id") == identity["snapshot_id"]
+            and approved.get("prepared_digest") == current_digest
+        )
+        if expected_state and current_root["commit"] == root_identity["commit"] and current_root["branch"] == root_identity["branch"]:
+            verify_isolation(checkout, identity)
+            return checkout, identity
     assert_not_in_use(checkout)
     backup = state / "native-source.previous"
     if backup.exists():
@@ -218,11 +282,12 @@ def stage_checkout(source, state):
     try:
         print("Creating an isolated snapshot of the public SONiC sources.", flush=True)
         clone_repository(source, temporary, source, temporary)
-        (temporary / MARKER).write_text("schema=1\n")
+        snapshot_id = write_snapshot_marker(temporary)
         exclude = temporary / ".git/info/exclude"
         with exclude.open("a") as stream:
             stream.write("\n/" + MARKER + "\n")
-        verify_isolation(temporary)
+        temporary_identity = snapshot_identity(temporary, snapshot_id)
+        verify_isolation(temporary, temporary_identity)
         if native_action.source_state(source) != snapshot:
             raise RuntimeError("public sources changed while staging; rerun scripts/bazel/run")
         staged = native_action.source_state(temporary)
@@ -233,6 +298,8 @@ def stage_checkout(source, state):
         }
         if staged != expected:
             raise RuntimeError("the staged public source bytes do not match the selected checkout")
+        raw = native_action.source_state(temporary, context="native", snapshot_identity=temporary_identity)
+        raw_digest = native_action.digest_bytes(native_action.canonical_json(raw))
         if checkout.exists():
             checkout.rename(backup)
         preserved = []
@@ -252,10 +319,13 @@ def stage_checkout(source, state):
                         (temporary / name).rename(backup / name)
                 backup.rename(checkout)
             raise
-        raw_digest = native_action.digest_bytes(native_action.canonical_json(staged))
-        receipt.write_text(json.dumps({"schema": 1, "digest": digest, "raw_digest": raw_digest}, indent=2) + "\n")
+        identity = snapshot_identity(checkout, snapshot_id)
+        write_json(receipt, {
+            "schema": 2, "digest": digest, "raw_digest": raw_digest,
+            "snapshot_identity": identity,
+        })
         if backup.exists():
             shutil.rmtree(backup)
     finally:
         shutil.rmtree(temporary_root, ignore_errors=True)
-    return checkout
+    return checkout, identity

@@ -84,7 +84,8 @@ class SourceSnapshotTest(unittest.TestCase):
 
     def stage(self, source):
         with mock.patch.object(source_snapshot, "assert_not_in_use"):
-            return source_snapshot.stage_checkout(source, self.root / "state")
+            destination, _identity = source_snapshot.stage_checkout(source, self.root / "state")
+            return destination
 
     def test_initialization_preserves_initialized_checkout_and_local_changes(self):
         source, child, first, _second = self.with_submodule()
@@ -153,7 +154,11 @@ class SourceSnapshotTest(unittest.TestCase):
         destination = self.root / "snapshot"
 
         source_snapshot.clone_repository(source, destination, source, destination)
-        source_snapshot.verify_isolation(destination)
+        snapshot_id = source_snapshot.write_snapshot_marker(destination)
+        with (destination / ".git/info/exclude").open("a") as stream:
+            stream.write("\n/" + source_snapshot.MARKER + "\n")
+        snapshot_identity = source_snapshot.snapshot_identity(destination, snapshot_id)
+        source_snapshot.verify_isolation(destination, snapshot_identity)
 
         self.assertEqual(identity(source), before_root)
         self.assertEqual(identity(child), before_child)
@@ -195,6 +200,51 @@ class SourceSnapshotTest(unittest.TestCase):
 
         self.assertEqual((destination / "tracked.txt").read_text(), "committed\n")
 
+    def test_fresh_snapshot_reuses_matching_receipt(self):
+        source = self.repository("source")
+        destination = self.stage(source)
+        first = json.loads((self.root / "state/native-source-input.json").read_text())
+
+        self.assertEqual(self.stage(source), destination)
+
+        second = json.loads((self.root / "state/native-source-input.json").read_text())
+        self.assertEqual(second, first)
+        self.assertEqual(destination.stat().st_ino, first["snapshot_identity"]["inode"])
+
+    def test_legacy_receipt_restages_without_changing_content_digest(self):
+        source = self.repository("source")
+        destination = self.stage(source)
+        receipt_path = self.root / "state/native-source-input.json"
+        first = json.loads(receipt_path.read_text())
+        retained = destination / "target/retained-artifact"
+        retained.parent.mkdir()
+        retained.write_text("retained native output\n")
+        (destination / source_snapshot.MARKER).write_text("schema=1\n")
+        receipt_path.write_text(json.dumps({
+            "schema": 1, "digest": first["digest"], "raw_digest": first["raw_digest"],
+        }))
+
+        destination = self.stage(source)
+
+        second = json.loads(receipt_path.read_text())
+        self.assertEqual(second["schema"], 2)
+        self.assertEqual(second["raw_digest"], first["raw_digest"])
+        self.assertNotEqual(second["snapshot_identity"]["snapshot_id"], first["snapshot_identity"]["snapshot_id"])
+        self.assertEqual((destination / "target/retained-artifact").read_text(), "retained native output\n")
+
+    def test_copied_snapshot_is_not_replaced_using_old_identity(self):
+        source = self.repository("source")
+        destination = self.stage(source)
+        original = self.root / "original-snapshot"
+        destination.rename(original)
+        shutil.copytree(original, destination, symlinks=True)
+
+        with self.assertRaisesRegex(RuntimeError, "identity"):
+            self.stage(source)
+
+        self.assertEqual((destination / "tracked.txt").read_text(), "committed\n")
+        self.assertTrue(original.is_dir())
+
     def test_restage_restores_native_submodule_revision(self):
         source, child, first, _second = self.with_submodule()
         destination = self.stage(source)
@@ -209,13 +259,20 @@ class SourceSnapshotTest(unittest.TestCase):
         destination = self.stage(source)
         git(destination / "deps/child", "switch", "--quiet", "--detach", first)
         (destination / "tracked.txt").write_text("approved preparation change\n")
+        generated = destination / "generated-source"
+        initialize(generated, "generated-source")
+        (generated / "tracked.txt").write_text("generated source\n")
+        commit(generated, "generated source fixture")
         input_receipt = json.loads((self.root / "state/native-source-input.json").read_text())
-        prepared = source_snapshot.native_action.source_state(destination)
+        prepared = source_snapshot.native_action.source_state(
+            destination, context="native", snapshot_identity=input_receipt["snapshot_identity"],
+        )
         approved_path = destination / "target/bazel/native-source-approved.json"
         approved_path.parent.mkdir(parents=True)
         approved_path.write_text(json.dumps({
-            "schema": 1,
+            "schema": 2,
             "source_input_digest": input_receipt["digest"],
+            "snapshot_id": input_receipt["snapshot_identity"]["snapshot_id"],
             "prepared_digest": source_snapshot.native_action.digest_bytes(
                 source_snapshot.native_action.canonical_json(prepared)
             ),
@@ -225,12 +282,14 @@ class SourceSnapshotTest(unittest.TestCase):
 
         self.assertEqual((destination / "tracked.txt").read_text(), "approved preparation change\n")
         self.assertEqual(identity(destination / "deps/child")[:2], (first, "HEAD"))
+        self.assertEqual((destination / "generated-source/tracked.txt").read_text(), "generated source\n")
 
-        (destination / "tracked.txt").write_text("later unapproved change\n")
+        (destination / "generated-source/tracked.txt").write_text("later unapproved source change\n")
         destination = self.stage(source)
 
         self.assertEqual((destination / "tracked.txt").read_text(), "committed\n")
         self.assertEqual(identity(destination / "deps/child")[:2], identity(child)[:2])
+        self.assertFalse((destination / "generated-source").exists())
 
     def test_copy_rejects_destination_symlink_before_creating_external_directories(self):
         source = self.root / "source-file"

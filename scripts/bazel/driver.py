@@ -217,8 +217,14 @@ def artifacts_match(artifacts):
     return True
 
 
+def native_source_state(request):
+    return native_action.source_state(
+        ROOT, context="native", snapshot_identity=request["native_snapshot_identity"],
+    )
+
+
 def preparation_key(request, inv, owned):
-    source = native_action.source_state(ROOT)
+    source = native_source_state(request)
     source_digest = native_action.digest_bytes(native_action.canonical_json(source))
     key_data = {
         "source": source_digest, "inventory": inv, "owned": owned,
@@ -231,9 +237,10 @@ def preparation_key(request, inv, owned):
 
 
 def approve_native_source(request):
-    source = native_action.source_state(ROOT)
+    source = native_source_state(request)
     write_json(STATE / "native-source-approved.json", {
-        "schema": 1, "source_input_digest": request["native_source_input_digest"],
+        "schema": 2, "source_input_digest": request["native_source_input_digest"],
+        "snapshot_id": request["native_snapshot_identity"]["snapshot_id"],
         "prepared_digest": native_action.digest_bytes(native_action.canonical_json(source)),
     })
 
@@ -353,7 +360,7 @@ def prepare_environment(request, inv, artifacts):
         "native_make_variables": request["_native_make_variables"],
     }))
     manifest = {
-        "schema": 1, "source": native_action.source_state(ROOT),
+        "schema": 1, "source": native_source_state(request),
         "environment": environment, "environment_digest": environment_digest,
         "native_environment": request["_native_environment"],
         "native_make_variables": request["_native_make_variables"],
@@ -548,6 +555,9 @@ def main():
         raise RuntimeError("invalid SONiC Bazel build request")
     if ROOT != Path("/sonic"):
         raise RuntimeError("driver.py must run in the public sonic-slave at /sonic")
+    runtime_identity = native_action.load_native_snapshot_identity(ROOT)
+    if runtime_identity != request.get("native_snapshot_identity"):
+        raise RuntimeError("native snapshot identity does not match the launcher request")
     request["_native_environment"], request["_private_environment"], request["_native_make_variables"] = capture_environment()
     request["_native_make_variables"].update({key: str(value) for key, value in request["make_variables"].items()})
     request["_native_make_variables"].update({"SONIC_DPKG_CACHE_METHOD": "none", "SONIC_DPKG_CACHE_METHOD_OVERRIDE": "none", "SONIC_VERSION_CACHE": ""})

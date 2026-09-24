@@ -30,6 +30,8 @@ GENERATED_ROOT_PATHS = {
     "target", "fsroot-vs", "fsroot.docker.trixie",
     "fs.squashfs", "dockerfs.tar.gz", "fs.zip",
 }
+NATIVE_SNAPSHOT_MARKER = ".sonic-bazel-native-source"
+NATIVE_SNAPSHOT_RUNTIME = "target/bazel/native-snapshot.json"
 
 
 def canonical_json(value):
@@ -57,53 +59,319 @@ def generated_root_path(name):
     return bool(Path(name).parts) and Path(name).parts[0] in GENERATED_ROOT_PATHS
 
 
-def git_source_listing(repository, root_repository=False):
+def _regular_json(path, description):
+    """Read a regular JSON file without following its final path component."""
+    try:
+        before = path.lstat()
+        if not stat.S_ISREG(before.st_mode):
+            raise RuntimeError(description + " must be a regular non-symlink file")
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor) as stream:
+            opened = os.fstat(stream.fileno())
+            if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                raise RuntimeError(description + " changed while opening it")
+            return json.load(stream)
+    except (OSError, ValueError) as error:
+        raise RuntimeError("invalid " + description + ": " + str(path)) from error
+
+
+def validate_native_snapshot(root, identity):
+    """Bind an internal native inventory request to its owned snapshot root."""
+    root = Path(root)
+    valid_identity = (
+        isinstance(identity, dict)
+        and set(identity) == {"schema", "snapshot_id", "device", "inode"}
+        and type(identity.get("schema")) is int and identity["schema"] == 1
+        and isinstance(identity.get("snapshot_id"), str)
+        and re.fullmatch(r"[0-9a-f]{32}", identity["snapshot_id"]) is not None
+        and type(identity.get("device")) is int and identity["device"] >= 0
+        and type(identity.get("inode")) is int and identity["inode"] > 0
+    )
+    if not valid_identity:
+        raise RuntimeError("invalid native snapshot identity")
+    try:
+        info = root.lstat()
+    except OSError as error:
+        raise RuntimeError("native snapshot root is unavailable: " + str(root)) from error
+    if not stat.S_ISDIR(info.st_mode):
+        raise RuntimeError("native snapshot root must be a directory, not a symlink")
+    if (info.st_dev, info.st_ino) != (identity["device"], identity["inode"]):
+        raise RuntimeError("native snapshot root does not match its runtime identity")
+    marker = _regular_json(root / NATIVE_SNAPSHOT_MARKER, "native snapshot marker")
+    if not isinstance(marker, dict) or type(marker.get("schema")) is not int or marker != {"schema": 2, "snapshot_id": identity["snapshot_id"]}:
+        raise RuntimeError("native snapshot marker does not match its runtime identity")
+    return dict(identity)
+
+
+def load_native_snapshot_identity(root):
+    """Load and validate the launcher-issued native snapshot runtime identity."""
+    root = Path(root)
+    runtime = root / NATIVE_SNAPSHOT_RUNTIME
+    current = root
+    for component in Path(NATIVE_SNAPSHOT_RUNTIME).parts[:-1]:
+        current = current / component
+        try:
+            info = current.lstat()
+        except OSError as error:
+            raise RuntimeError("native snapshot runtime directory is unavailable: " + str(current)) from error
+        if not stat.S_ISDIR(info.st_mode):
+            raise RuntimeError("native snapshot runtime path must not traverse a symlink")
+    identity = _regular_json(runtime, "native snapshot runtime identity")
+    return validate_native_snapshot(root, identity)
+
+
+def _native_git_environment():
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    environment.update({
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+    })
+    return environment
+
+
+def _git_command(arguments, native=False):
+    command = ["git"]
+    if native:
+        command.extend([
+            "-c", "core.fsmonitor=false",
+            "-c", "core.excludesFile=/dev/null",
+            "-c", "core.hooksPath=/dev/null",
+            "-c", "core.untrackedCache=false",
+        ])
+    return command + arguments
+
+
+def _native_mountpoints():
+    try:
+        with open("/proc/self/mountinfo") as stream:
+            return {
+                Path(re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), line.split(" ", 5)[4]))
+                for line in stream
+            }
+    except (OSError, IndexError) as error:
+        raise RuntimeError("cannot inspect native snapshot mount containment") from error
+
+
+def _validate_native_repository(directory, root, environment, mountpoints):
+    """Require an independent standalone Git checkout inside the native root."""
+    directory = directory.absolute()
+    try:
+        canonical = directory.resolve(strict=True)
+        relative = directory.relative_to(root)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise RuntimeError("native repository leaves the snapshot: " + str(directory)) from error
+    if canonical != directory:
+        raise RuntimeError("native repository path must not traverse a symlink: " + str(directory))
+    current = root
+    for component in (None, *relative.parts):
+        if component is not None:
+            current = current / component
+        try:
+            info = current.lstat()
+        except OSError as error:
+            raise RuntimeError("native repository path is unavailable: " + str(current)) from error
+        if not stat.S_ISDIR(info.st_mode):
+            raise RuntimeError("native repository path must contain only directories: " + str(current))
+        if current != root and current in mountpoints:
+            raise RuntimeError("native repository path contains a nested mount: " + str(current))
+
+    git_directory = directory / ".git"
+    try:
+        git_info = git_directory.lstat()
+    except OSError as error:
+        raise RuntimeError("native repository requires a local .git directory: " + str(directory)) from error
+    if not stat.S_ISDIR(git_info.st_mode):
+        raise RuntimeError("native repository requires a local .git directory: " + str(directory))
+    forbidden = {
+        git_directory / "commondir",
+        git_directory / "objects/info/alternates",
+        git_directory / "objects/info/http-alternates",
+    }
+    pending = [git_directory]
+    seen_storage = set()
+    while pending:
+        path = pending.pop()
+        try:
+            info = path.lstat()
+        except OSError as error:
+            raise RuntimeError("native Git storage changed while inspecting it: " + str(path)) from error
+        if path in forbidden:
+            raise RuntimeError("native Git storage contains an unsupported indirection: " + str(path))
+        if path in mountpoints:
+            raise RuntimeError("native Git storage contains a nested mount: " + str(path))
+        if stat.S_ISLNK(info.st_mode):
+            raise RuntimeError("native Git storage contains a symlink: " + str(path))
+        if stat.S_ISDIR(info.st_mode):
+            storage_identity = (info.st_dev, info.st_ino)
+            if storage_identity in seen_storage:
+                raise RuntimeError("native Git storage repeats a directory: " + str(path))
+            seen_storage.add(storage_identity)
+            try:
+                with os.scandir(path) as entries:
+                    pending.extend(path / entry.name for entry in entries)
+            except OSError as error:
+                raise RuntimeError("native Git storage is unavailable: " + str(path)) from error
+        elif stat.S_ISREG(info.st_mode):
+            if info.st_nlink != 1:
+                raise RuntimeError("native Git storage contains a file with hard links: " + str(path))
+        else:
+            raise RuntimeError("native Git storage contains a special file: " + str(path))
+
+    for configuration in (git_directory / "config", git_directory / "config.worktree"):
+        if configuration.exists():
+            try:
+                keys = subprocess.check_output(
+                    _git_command(["config", "--file", str(configuration), "--no-includes", "--name-only", "--null", "--list"], native=True),
+                    cwd=directory, env=environment, stderr=subprocess.STDOUT,
+                )
+            except (OSError, subprocess.CalledProcessError) as error:
+                raise RuntimeError("invalid native Git configuration: " + str(configuration)) from error
+            if any(key.lower().startswith((b"include.", b"includeif.")) for key in keys.split(b"\0") if key):
+                raise RuntimeError("native Git configuration must not include external files: " + str(configuration))
+    try:
+        reported = command_output(
+            _git_command(["rev-parse", "--path-format=absolute", "--show-toplevel", "--absolute-git-dir", "--git-common-dir"], native=True),
+            directory, env=environment,
+        ).splitlines()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise RuntimeError("invalid native Git repository: " + str(directory)) from error
+    if reported != [str(directory), str(git_directory), str(git_directory)]:
+        raise RuntimeError("native Git repository worktree or storage leaves its local checkout: " + str(directory))
+    return canonical
+
+
+def _validate_native_source_ancestry(repository, name, checked):
+    """Reject malformed embedded Git layouts exposed as individual source files."""
+    current = repository
+    for component in Path(name).parts[:-1]:
+        current = current / component
+        if current in checked:
+            continue
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            return
+        if not stat.S_ISDIR(info.st_mode):
+            return
+        try:
+            (current / ".git").lstat()
+        except FileNotFoundError:
+            checked.add(current)
+        else:
+            raise RuntimeError("native Git listed a source path through an unsupported embedded repository: " + str(current))
+
+
+def git_source_listing(repository, root_repository=False, env=None):
     """List source entries without traversing generated paths in the root repo."""
-    command = ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"]
+    command = _git_command(["ls-files", "--cached", "--others", "--exclude-standard", "-z"], native=env is not None)
     if root_repository:
         command.extend("--exclude=/" + name for name in sorted(GENERATED_ROOT_PATHS))
-    return subprocess.check_output(command, cwd=repository)
+    return subprocess.check_output(command, cwd=repository, env=env)
 
 
-def git_sources(root, exclude_swss=True):
+def git_sources(root, exclude_swss=True, context="caller", snapshot_identity=None):
     """Return source paths and repository identities, excluding SWSS inputs."""
+    root = Path(root)
+    if context not in {"caller", "native"}:
+        raise RuntimeError("unsupported source inventory context: " + str(context))
+    native = context == "native"
+    if native:
+        validate_native_snapshot(root, snapshot_identity)
+        root = root.absolute()
+        environment = _native_git_environment()
+        mountpoints = _native_mountpoints()
+    else:
+        if snapshot_identity is not None:
+            raise RuntimeError("snapshot identity is only valid for native inventory")
+        environment = None
+        mountpoints = set()
     paths = set()
     repositories = []
+    visited = set()
+    checked_source_directories = set()
 
-    def visit(directory, prefix):
+    def visit(directory, prefix, role):
+        if native:
+            canonical = _validate_native_repository(directory, root, environment, mountpoints)
+            if canonical in visited:
+                raise RuntimeError("native source inventory repeats a repository: " + str(directory))
+            visited.add(canonical)
         identity = {
             "path": prefix or ".",
-            "commit": command_output(["git", "rev-parse", "HEAD"], directory),
-            "branch": command_output(["git", "rev-parse", "--abbrev-ref", "HEAD"], directory),
+            "commit": command_output(_git_command(["rev-parse", "HEAD"], native), directory, env=environment),
+            "branch": command_output(_git_command(["rev-parse", "--abbrev-ref", "HEAD"], native), directory, env=environment),
         }
+        if native:
+            identity["role"] = role
         repositories.append(identity)
-        staged = subprocess.check_output(["git", "ls-files", "--stage", "-z"], cwd=directory)
+        staged = subprocess.check_output(_git_command(["ls-files", "--stage", "-z"], native), cwd=directory, env=environment)
         submodules = set()
         for record in staged.split(b"\0"):
             if not record:
                 continue
-            metadata, encoded = record.split(b"\t", 1)
-            if metadata.startswith(b"160000 "):
+            try:
+                metadata, encoded = record.split(b"\t", 1)
+            except ValueError as error:
+                if native:
+                    raise RuntimeError("invalid native Git index entry") from error
+                raise
+            if native:
+                try:
+                    mode, _object, stage = metadata.split()
+                except ValueError as error:
+                    raise RuntimeError("invalid native Git index entry") from error
+                if stage != b"0":
+                    raise RuntimeError("native source repository has unresolved Git conflicts: " + str(directory))
+                name = os.fsdecode(encoded)
+                logical = Path(name)
+                if not name or logical.is_absolute() or ".." in logical.parts:
+                    raise RuntimeError("native Git source path leaves the snapshot: " + name)
+                if mode == b"160000":
+                    if role == "generated":
+                        raise RuntimeError("generated native repositories must not contain gitlinks: " + str(directory))
+                    submodules.add(name)
+            elif metadata.startswith(b"160000 "):
                 submodules.add(os.fsdecode(encoded))
-        listed = git_source_listing(directory, root_repository=not prefix)
+        listed = git_source_listing(directory, root_repository=not prefix, env=environment)
         for encoded in listed.split(b"\0"):
             if not encoded:
                 continue
             name = os.fsdecode(encoded)
+            if native:
+                logical = Path(name)
+                if not name or logical.is_absolute() or ".." in logical.parts:
+                    raise RuntimeError("native Git source path leaves the snapshot: " + name)
             relative = str(Path(prefix) / name) if prefix else name
             if not prefix and generated_root_path(name):
                 continue
+            if native and not prefix and name == NATIVE_SNAPSHOT_MARKER:
+                continue
             if exclude_swss and (relative == "src/sonic-swss" or relative.startswith("src/sonic-swss/")):
                 continue
+            if native:
+                _validate_native_source_ancestry(directory, name, checked_source_directories)
             if name in submodules:
                 child = directory / name
-                if not (child / ".git").exists():
+                if not native and not (child / ".git").exists():
                     raise RuntimeError("uninitialized public submodule: " + relative)
-                visit(child, relative)
+                visit(child, relative, "submodule")
             else:
+                if native:
+                    child = directory / name
+                    try:
+                        is_directory = stat.S_ISDIR(child.lstat().st_mode)
+                    except FileNotFoundError:
+                        is_directory = False
+                    if is_directory:
+                        if role == "generated":
+                            raise RuntimeError("generated native repositories must not contain embedded repositories: " + relative)
+                        visit(child, str(Path(relative)), "generated")
+                        continue
                 paths.add(relative)
 
-    visit(root, "")
+    visit(root, "", "root")
     return sorted(paths), sorted(repositories, key=lambda item: item["path"])
 
 
@@ -126,8 +394,8 @@ def source_entry(root, relative):
     return {"kind": "file", "mode": mode, "size": info.st_size, "sha256": digest_file(path)}
 
 
-def source_state(root):
-    paths, repositories = git_sources(root)
+def source_state(root, context="caller", snapshot_identity=None):
+    paths, repositories = git_sources(root, context=context, snapshot_identity=snapshot_identity)
     return {
         "repositories": repositories,
         "entries": {relative: source_entry(root, relative) for relative in paths},
@@ -174,7 +442,8 @@ def verify_manifest(manifest, root):
     content = {key: value for key, value in manifest.items() if key != "digest"}
     if digest_bytes(canonical_json(content)) != expected_digest:
         raise RuntimeError("SONiC Bazel source manifest checksum is invalid")
-    actual = source_state(root)
+    identity = load_native_snapshot_identity(root)
+    actual = source_state(root, context="native", snapshot_identity=identity)
     if actual != manifest["source"]:
         expected_entries = manifest["source"]["entries"]
         actual_entries = actual["entries"]
