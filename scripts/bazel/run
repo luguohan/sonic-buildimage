@@ -134,7 +134,9 @@ def build(args):
     stamp_environment.update({"BUILD_TIMESTAMP": timestamp, "BUILD_NUMBER": "0"})
     version = output(["bash", "-c", ". functions.sh; sonic_get_version"], cwd=native, env=stamp_environment)
     variables = {
-        "PLATFORM": "vs", "PLATFORM_ARCH": "amd64", "SONIC_BUILD_JOBS": args.jobs,
+        # Build through .platform after configure. Runtime helpers used by
+        # native tests also interpret a nonempty PLATFORM environment value.
+        "PLATFORM": "", "PLATFORM_ARCH": "amd64", "SONIC_BUILD_JOBS": args.jobs,
         "SONIC_CONFIG_MAKE_JOBS": args.jobs, "BUILD_NUMBER": "0",
         "BUILD_TIMESTAMP": timestamp, "SONIC_IMAGE_VERSION": version,
         "SOURCE_DATE_EPOCH": epoch,
@@ -147,7 +149,7 @@ def build(args):
     configured = (native / ".platform").is_file() and (native / ".platform").read_text().strip() == "vs"
     configured = configured and (native / ".arch").is_file() and (native / ".arch").read_text().strip() == "amd64"
     if not configured:
-        run(make_command("configure", variables), cwd=native)
+        run(make_command("configure", {**variables, "PLATFORM": "vs"}), cwd=native)
     run(make_command("sonic-slave-build", variables), cwd=native)
     tag_output = output(make_command("showtag", variables), cwd=native)
     tags = [line for line in tag_output.splitlines() if re.fullmatch(r"[A-Za-z0-9_./-]+:[A-Za-z0-9_.-]+", line)]
