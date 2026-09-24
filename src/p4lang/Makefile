@@ -47,7 +47,7 @@ $(addprefix $(DEST)/, $(P4LANG_P4C_TARGET)): $(DEST)/% :
 	patch --batch --forward --reject-file=- -p0 -i p4lang-p4c-regional-source.dsc.patch
 	curl -fL -o p4lang-p4c_$(P4LANG_P4C_VERSION).orig.tar.gz https://downloadcontent.opensuse.org/repositories/home:/p4lang/Debian_11/p4lang-p4c_$(P4LANG_P4C_VERSION).orig.tar.gz
 	curl -fL -o p4lang-p4c_$(P4LANG_P4C_VERSION_FULL).debian.tar.xz http://download.opensuse.org/repositories/home:/p4lang/Debian_11/p4lang-p4c_$(P4LANG_P4C_VERSION_FULL).debian.tar.xz
-	echo "117b36ebd0b07d034cd2bb319c7f63be692ea4dda90cc9f58d2015bb8ccf2fb8  p4lang-p4c_$(P4LANG_P4C_VERSION).orig.tar.gz" | sha256sum -c -
+	echo "a41d616add63924a098edaab446809f543ffadfc2e40356f9b73986f324c668a  p4lang-p4c_$(P4LANG_P4C_VERSION).orig.tar.gz" | sha256sum -c -
 	echo "2a39bf04c8d084724014b71cdeb3b91dbe7a32bf1bd6cd499e5e132aa3e4cb40  p4lang-p4c_$(P4LANG_P4C_VERSION_FULL).debian.tar.xz" | sha256sum -c -
 	dpkg-source -x --require-strong-checksums p4lang-p4c_$(P4LANG_P4C_VERSION_FULL).dsc
 	pushd p4lang-p4c-$(P4LANG_P4C_VERSION)
