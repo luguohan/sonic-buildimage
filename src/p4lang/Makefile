@@ -41,7 +41,15 @@ P4LANG_P4C_TARGET = p4lang-p4c_$(P4LANG_P4C_VERSION_FULL)_$(CONFIGURED_ARCH).deb
 $(addprefix $(DEST)/, $(P4LANG_P4C_TARGET)): $(DEST)/% :
 # 	# Remove any stale files
 	rm -rf p4lang-p4c-$(P4LANG_P4C_VERSION)
-	dget -u p4lang-p4c_$(P4LANG_P4C_VERSION_FULL).dsc http://download.opensuse.org/repositories/home:/p4lang/Debian_11/p4lang-p4c_$(P4LANG_P4C_VERSION_FULL).dsc
+	# Verify the selected Debian 11 source files before extracting them.
+	curl -fL -o p4lang-p4c_$(P4LANG_P4C_VERSION_FULL).dsc http://download.opensuse.org/repositories/home:/p4lang/Debian_11/p4lang-p4c_$(P4LANG_P4C_VERSION_FULL).dsc
+	echo "2ee97ffd3f82d67e04ee149f12ef8c58377f9db37e76d4aaa54518178c7f0fb7  p4lang-p4c_$(P4LANG_P4C_VERSION_FULL).dsc" | sha256sum -c -
+	patch --batch --forward --reject-file=- -p0 -i p4lang-p4c-regional-source.dsc.patch
+	curl -fL -o p4lang-p4c_$(P4LANG_P4C_VERSION).orig.tar.gz https://downloadcontent.opensuse.org/repositories/home:/p4lang/Debian_11/p4lang-p4c_$(P4LANG_P4C_VERSION).orig.tar.gz
+	curl -fL -o p4lang-p4c_$(P4LANG_P4C_VERSION_FULL).debian.tar.xz http://download.opensuse.org/repositories/home:/p4lang/Debian_11/p4lang-p4c_$(P4LANG_P4C_VERSION_FULL).debian.tar.xz
+	echo "117b36ebd0b07d034cd2bb319c7f63be692ea4dda90cc9f58d2015bb8ccf2fb8  p4lang-p4c_$(P4LANG_P4C_VERSION).orig.tar.gz" | sha256sum -c -
+	echo "2a39bf04c8d084724014b71cdeb3b91dbe7a32bf1bd6cd499e5e132aa3e4cb40  p4lang-p4c_$(P4LANG_P4C_VERSION_FULL).debian.tar.xz" | sha256sum -c -
+	dpkg-source -x --require-strong-checksums p4lang-p4c_$(P4LANG_P4C_VERSION_FULL).dsc
 	pushd p4lang-p4c-$(P4LANG_P4C_VERSION)
 	patch -p1 -i ../p4lang-p4c.patch/use-boost-1.83.patch
 	patch -p1 -i ../p4lang-p4c.patch/fix-build-for-boost-1.83.patch

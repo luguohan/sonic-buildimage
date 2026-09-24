@@ -1,0 +1,16 @@
+--- p4lang-p4c_1.2.4.2-3.dsc
++++ p4lang-p4c_1.2.4.2-3.dsc
+@@ -12,11 +12,8 @@
+ Package-List:
+  p4lang-p4c deb devel optional arch=amd64,arm64
+-Checksums-Sha1:
+- 5e4431c76e77ead4a6c1eb184d06b20fb9fa4b35 173761028 p4lang-p4c_1.2.4.2.orig.tar.gz
+- 6b6eabcfa411decc2e771d6d26ccbd2f29652950 2796 p4lang-p4c_1.2.4.2-3.debian.tar.xz
+ Checksums-Sha256:
+- 312e94e556d702823e70a3ac0999e17f1de5f1cdf6b444dab2058f562c8313df 173761028 p4lang-p4c_1.2.4.2.orig.tar.gz
++ 117b36ebd0b07d034cd2bb319c7f63be692ea4dda90cc9f58d2015bb8ccf2fb8 173732452 p4lang-p4c_1.2.4.2.orig.tar.gz
+  2a39bf04c8d084724014b71cdeb3b91dbe7a32bf1bd6cd499e5e132aa3e4cb40 2796 p4lang-p4c_1.2.4.2-3.debian.tar.xz
+ Files:
+- ead3b9a48dd0052016d69f31df9385f6 173761028 p4lang-p4c_1.2.4.2.orig.tar.gz
++ b1008dffbe236d065c5557f2d4629aa9 173732452 p4lang-p4c_1.2.4.2.orig.tar.gz
+  f15bf03afd4766e5c986f5036c38e773 2796 p4lang-p4c_1.2.4.2-3.debian.tar.xz
