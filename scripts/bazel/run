@@ -125,13 +125,14 @@ def build(args):
     native = source_snapshot.stage_checkout(ROOT, STATE)
     native_state = native / "target/bazel"
     swss = sync_swss(source, native_state)
-    commit = output(["git", "rev-parse", "HEAD"])
-    branch = output(["git", "rev-parse", "--abbrev-ref", "HEAD"])
-    epoch = int(output(["git", "show", "-s", "--format=%ct", "HEAD"]))
+    # Stamp the snapshot that will be built, even if the caller edits its checkout.
+    commit = output(["git", "rev-parse", "HEAD"], native)
+    branch = output(["git", "rev-parse", "--abbrev-ref", "HEAD"], native)
+    epoch = int(output(["git", "show", "-s", "--format=%ct", "HEAD"], native))
     timestamp = datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime("%Y%m%d.%H%M%S")
     stamp_environment = os.environ.copy()
     stamp_environment.update({"BUILD_TIMESTAMP": timestamp, "BUILD_NUMBER": "0"})
-    version = output(["bash", "-c", ". functions.sh; sonic_get_version"], env=stamp_environment)
+    version = output(["bash", "-c", ". functions.sh; sonic_get_version"], cwd=native, env=stamp_environment)
     variables = {
         "PLATFORM": "vs", "PLATFORM_ARCH": "amd64", "SONIC_BUILD_JOBS": args.jobs,
         "SONIC_CONFIG_MAKE_JOBS": args.jobs, "BUILD_NUMBER": "0",
