@@ -44,6 +44,7 @@ def main():
         "distro": value("BAZEL_DISTRO"),
         "swss": value("BAZEL_SWSS"),
         "swss_dbg": value("BAZEL_SWSS_DBG"),
+        "p4c_version": value("BAZEL_P4C_VERSION"),
         "swss_depends": words("BAZEL_SWSS_DEPENDS"),
         "swss_rdepends": words("BAZEL_SWSS_RDEPENDS"),
         "swss_deb_build_options": value("BAZEL_SWSS_DEB_BUILD_OPTIONS"),

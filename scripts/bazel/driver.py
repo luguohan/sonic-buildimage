@@ -273,6 +273,9 @@ def prepare_native(request, inv, owned):
         missing = [path for path in prerequisite_targets(inv, owned) if not (ROOT / path).is_file()]
         if missing:
             raise RuntimeError("native preparation did not produce: " + ", ".join(missing[:8]))
+        native_action.cleanup_p4_source_repositories(
+            ROOT, request["native_snapshot_identity"], inv["p4c_version"],
+        )
         key = preparation_key(request, inv, owned)
         write_json(receipt_path, {"schema": 1, "key": key, "artifacts": artifacts})
     approve_native_source(request)

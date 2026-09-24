@@ -402,6 +402,40 @@ def source_state(root, context="caller", snapshot_identity=None):
     }
 
 
+def cleanup_p4_source_repositories(root, snapshot_identity, p4c_version):
+    """Remove disposable Git worktrees left by completed P4C and DASH packages."""
+    if not isinstance(p4c_version, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.+~_-]*", p4c_version):
+        raise RuntimeError("invalid P4C version for native source cleanup")
+    root = Path(root).absolute()
+    validate_native_snapshot(root, snapshot_identity)
+    environment = _native_git_environment()
+    mountpoints = _native_mountpoints()
+    _validate_native_repository(root, root, environment, mountpoints)
+    listed = git_source_listing(root, root_repository=True, env=environment)
+    generated = {
+        os.fsdecode(entry).rstrip("/")
+        for entry in listed.split(b"\0") if entry.endswith(b"/")
+    }
+    planned = []
+    for logical in ("src/dash-sai/DASH", "src/p4lang/p4lang-p4c-" + p4c_version):
+        path = root / logical
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            continue
+        if logical not in generated:
+            raise RuntimeError("native source cleanup path is not a generated repository: " + logical)
+        _validate_native_repository(path, root, environment, mountpoints)
+        if any(path == mount or path in mount.parents for mount in mountpoints):
+            raise RuntimeError("native source cleanup refuses a nested mount: " + logical)
+        planned.append((logical, path))
+    # Validate both paths before removing either. Package outputs live under
+    # target/ and have already been checked by the preparation driver.
+    for logical, path in planned:
+        shutil.rmtree(path)
+        print("Removed completed native source repository " + logical, flush=True)
+
+
 def tool_environment(slave_image_id, environment=None):
     commands = {
         "packages": ["dpkg-query", "-W", "-f=${binary:Package}\t${Version}\t${Architecture}\t${db:Status-Abbrev}\n"],

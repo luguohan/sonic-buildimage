@@ -183,6 +183,41 @@ class NativeSourceInventoryTest(unittest.TestCase):
         self.repository(generated / "leaf")
         self.assert_rejected_before_source_read(root, identity, "must not contain embedded repositories")
 
+    def test_completed_p4_source_cleanup_preserves_outputs_and_restores_inventory(self):
+        root, identity = self.native_root()
+        output = root / "target/debs/trixie/p4lang-p4c_1.2.4.2-3_amd64.deb"
+        output.parent.mkdir(parents=True)
+        output.write_bytes(b"completed package")
+        paths = [root / "src/dash-sai/DASH", root / "src/p4lang/p4lang-p4c-1.2.4.2"]
+        for path in paths:
+            generated = self.repository(path)
+            revision = git(generated, "rev-parse", "HEAD")
+            git(generated, "update-index", "--add", "--cacheinfo", "160000," + revision + ",nested")
+        self.assert_rejected_before_source_read(root, identity, "must not contain gitlinks")
+
+        native_action.cleanup_p4_source_repositories(root, identity, "1.2.4.2")
+
+        self.assertTrue(all(not path.exists() for path in paths))
+        self.assertEqual(output.read_bytes(), b"completed package")
+        self.state(root, identity)
+        native_action.cleanup_p4_source_repositories(root, identity, "1.2.4.2")
+
+    def test_completed_p4_source_cleanup_refuses_unclassified_and_mounted_paths(self):
+        root, identity = self.native_root()
+        ordinary = root / "src/dash-sai/DASH"
+        ordinary.mkdir(parents=True)
+        (ordinary / "source.txt").write_text("caller source\n")
+        with self.assertRaisesRegex(RuntimeError, "not a generated repository"):
+            native_action.cleanup_p4_source_repositories(root, identity, "1.2.4.2")
+        self.assertEqual((ordinary / "source.txt").read_text(), "caller source\n")
+
+        root, identity = self.native_root()
+        generated = self.repository(root / "src/dash-sai/DASH")
+        with mock.patch.object(native_action, "_native_mountpoints", return_value={generated / "mounted"}):
+            with self.assertRaisesRegex(RuntimeError, "refuses a nested mount"):
+                native_action.cleanup_p4_source_repositories(root, identity, "1.2.4.2")
+        self.assertTrue(generated.is_dir())
+
     def test_every_reached_repository_requires_a_local_git_directory(self):
         root, identity = self.native_root()
         child = self.add_submodule(root)
