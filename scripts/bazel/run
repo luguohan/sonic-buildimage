@@ -139,7 +139,9 @@ def build(args):
         "SOURCE_DATE_EPOCH": epoch,
         "BUILD_HOSTNAME": "sonic-bazel-local",
         "SONIC_DPKG_CACHE_METHOD": "none", "SONIC_DPKG_CACHE_METHOD_OVERRIDE": "none",
+        "SONIC_DPKG_CACHE_SOURCE": str(native_state / "native-cache"),
         "SONIC_VERSION_CACHE_METHOD": "none",
+        "SONIC_VERSION_CACHE_SOURCE": str(native_state / "native-cache/vcache"),
     }
     configured = (native / ".platform").is_file() and (native / ".platform").read_text().strip() == "vs"
     configured = configured and (native / ".arch").is_file() and (native / ".arch").read_text().strip() == "amd64"
