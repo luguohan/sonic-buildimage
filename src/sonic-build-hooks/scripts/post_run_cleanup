@@ -10,8 +10,7 @@ set -x
 if [ ! -z "$(get_version_cache_option)" ]; then
 
 	#Delete the rsync package files
-	# The Trixie base declares rsync for downstream image copy stages.
-	if [[ ! ${IMAGENAME} =~ -slave- && ${IMAGENAME} != docker-base-trixie ]]; then
+	if [[ ! ${IMAGENAME} =~ -slave- ]]; then
 		/usr/bin/apt-get purge -y --auto-remove rsync
 	fi
 fi
