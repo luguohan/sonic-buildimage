@@ -25,7 +25,7 @@ PRIVATE_KEYS = {
     "PASSWORD", "BMC_ROOT_ACCOUNT_DEFAULT_PASSWORD", "HTTP_PROXY",
     "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
 }
-PROCESS_KEYS = set("HOME USER LOGNAME SHELL PATH LANG LC_ALL TZ RUSTUP_HOME DOCKER_HOST DOCKER_BUILDKIT".split())
+PROCESS_KEYS = set("HOME USER LOGNAME SHELL PATH LANG LC_ALL TZ RUSTUP_HOME DOCKER_HOST DOCKER_BUILDKIT IMAGENAME".split())
 GENERATED_ROOT_PATHS = {
     "target", "fsroot-vs", "fsroot.docker.trixie",
     "fs.squashfs", "dockerfs.tar.gz", "fs.zip",
