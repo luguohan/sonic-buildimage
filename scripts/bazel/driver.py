@@ -190,19 +190,22 @@ def artifact_state(inv):
     excluded_names = set(inv["owned_dockers"]) | {inv["swss"], inv["swss_dbg"], "sonic-vs.bin", "sonic-vs.img.gz", "sonic-vs-uefi.img.gz"}
     result = {}
     target = ROOT / "target"
-    for path in target.rglob("*"):
-        if not path.is_file() or path.is_symlink():
-            continue
-        relative = path.relative_to(ROOT)
-        parts = relative.parts
-        if len(parts) > 1 and parts[1] in {"bazel", "vcache", "versions", "logs", "phony"}:
-            continue
-        if path.name in excluded_names or path.name.endswith((".log", ".lock", ".dep", ".tmp")):
-            continue
-        selected = len(parts) > 1 and parts[1] in {"debs", "files", "python-debs", "python-wheels"}
-        selected = selected or path.name.endswith((".gz", ".squashfs", ".iso"))
-        if selected:
-            result[str(relative)] = {"sha256": native_action.digest_file(path), "size": path.stat().st_size}
+    for directory, directories, filenames in os.walk(target):
+        directory = Path(directory)
+        if directory == target:
+            directories[:] = [name for name in directories if name not in {"bazel", "vcache", "versions", "logs", "phony"}]
+        for filename in filenames:
+            path = directory / filename
+            if not path.is_file() or path.is_symlink():
+                continue
+            relative = path.relative_to(ROOT)
+            parts = relative.parts
+            if path.name in excluded_names or path.name.endswith((".log", ".lock", ".dep", ".tmp")):
+                continue
+            selected = len(parts) > 1 and parts[1] in {"debs", "files", "python-debs", "python-wheels"}
+            selected = selected or path.name.endswith((".gz", ".squashfs", ".iso"))
+            if selected:
+                result[str(relative)] = {"sha256": native_action.digest_file(path), "size": path.stat().st_size}
     return result
 
 

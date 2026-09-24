@@ -146,9 +146,7 @@ def clone_repository(source, destination, source_root, destination_root):
     else:
         run(["git", "remote", "remove", "origin"], destination)
     excluded = gitlinks(source)
-    encoded = subprocess.check_output(
-        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"], cwd=source,
-    )
+    encoded = native_action.git_source_listing(source, root_repository=source == source_root)
     for name in sorted({os.fsdecode(item) for item in encoded.split(b"\0") if item} - set(excluded)):
         if source == source_root and native_action.generated_root_path(name):
             continue

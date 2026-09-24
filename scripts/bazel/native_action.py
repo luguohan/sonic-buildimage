@@ -57,6 +57,14 @@ def generated_root_path(name):
     return bool(Path(name).parts) and Path(name).parts[0] in GENERATED_ROOT_PATHS
 
 
+def git_source_listing(repository, root_repository=False):
+    """List source entries without traversing generated paths in the root repo."""
+    command = ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"]
+    if root_repository:
+        command.extend("--exclude=/" + name for name in sorted(GENERATED_ROOT_PATHS))
+    return subprocess.check_output(command, cwd=repository)
+
+
 def git_sources(root, exclude_swss=True):
     """Return source paths and repository identities, excluding SWSS inputs."""
     paths = set()
@@ -77,10 +85,7 @@ def git_sources(root, exclude_swss=True):
             metadata, encoded = record.split(b"\t", 1)
             if metadata.startswith(b"160000 "):
                 submodules.add(os.fsdecode(encoded))
-        listed = subprocess.check_output(
-            ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
-            cwd=directory,
-        )
+        listed = git_source_listing(directory, root_repository=not prefix)
         for encoded in listed.split(b"\0"):
             if not encoded:
                 continue
