@@ -802,10 +802,13 @@ elif [[ $RFS_SPLIT_LAST_STAGE == y ]]; then
 fi
 
 if [[ $RFS_SPLIT_LAST_STAGE == y || $SONIC_BAZEL_BUILD_STAGE == image ]]; then
-    ## make / as a mountpoint in chroot env, needed by dockerd
-    pushd $FILESYSTEM_ROOT
-    sudo mount --bind . .
-    popd
+    # The Bazel host stage snapshots the root before starting dockerd.
+    if [[ $SONIC_BAZEL_BUILD_STAGE != host ]]; then
+        ## make / as a mountpoint in chroot env, needed by dockerd
+        pushd $FILESYSTEM_ROOT
+        sudo mount --bind . .
+        popd
+    fi
 
     trap_push 'sudo LANG=C chroot $FILESYSTEM_ROOT umount /proc || true'
     sudo LANG=C chroot $FILESYSTEM_ROOT mount proc /proc -t proc
