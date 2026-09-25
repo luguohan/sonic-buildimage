@@ -854,7 +854,10 @@ fi
 ## Organization specific extensions such as Configuration & Scripts for features like AAA, ZTP...
 if [ "${enable_organization_extensions}" = "y" ]; then
    if [ -f files/build_templates/organization_extensions.sh ]; then
-      sudo chmod 755 files/build_templates/organization_extensions.sh
+      # Preserve the source mode recorded by the Bazel image action.
+      if [[ $SONIC_BAZEL_BUILD_STAGE != image ]]; then
+         sudo chmod 755 files/build_templates/organization_extensions.sh
+      fi
       ./files/build_templates/organization_extensions.sh -f $FILESYSTEM_ROOT -h $HOSTNAME
    fi
 fi
