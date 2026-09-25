@@ -9,6 +9,8 @@
 ##          The name of the default admin user
 ##   PASSWORD
 ##          The password, expected by chpasswd command
+##   SONIC_BUILD_CA_CERT
+##          Optional CA certificate for build-time HTTPS access; removed before final packaging
 
 ## Default user
 [ -n "$USERNAME" ] || {
@@ -30,6 +32,36 @@ run_organization_build_hook()
 {
     if [ -f "$ORGANIZATION_BUILD_HOOK" ]; then
         . "$ORGANIZATION_BUILD_HOOK" "$1"
+    fi
+}
+
+# A minbase root may not contain ca-certificates yet. Keep an optional builder
+# CA through build-time network access, then restore image-owned trust.
+sonic_prepare_rootfs_build_ca()
+{
+    [[ -n "${SONIC_BUILD_CA_CERT:-}" ]] || return 0
+    local temporary_ca="$FILESYSTEM_ROOT/usr/local/share/ca-certificates/sonic-build-temporary-ca.crt"
+    local cleanup_marker="$FILESYSTEM_ROOT/usr/local/share/ca-certificates/sonic-build-temporary-ca.cleanup"
+    local rootfs_bundle="$FILESYSTEM_ROOT/etc/ssl/certs/ca-certificates.crt"
+    [[ ! -e "$temporary_ca" && ! -L "$temporary_ca" && ! -e "$cleanup_marker" && ! -L "$cleanup_marker" ]] || die "Reserved rootfs build CA path already exists"
+    sudo install -D -m 0644 "$SONIC_BUILD_CA_CERT" "$temporary_ca"
+    sudo install -D -m 0644 /etc/ssl/certs/ca-certificates.crt "$rootfs_bundle"
+    sudo sh -c 'cat "$1" >> "$2"' -- "$SONIC_BUILD_CA_CERT" "$rootfs_bundle"
+}
+
+sonic_remove_rootfs_build_ca()
+{
+    local temporary_ca="$FILESYSTEM_ROOT/usr/local/share/ca-certificates/sonic-build-temporary-ca.crt"
+    local cleanup_marker="$FILESYSTEM_ROOT/usr/local/share/ca-certificates/sonic-build-temporary-ca.cleanup"
+    if [[ -e "$temporary_ca" || -L "$temporary_ca" ]]; then
+        [[ -f "$temporary_ca" && ! -L "$temporary_ca" ]] || die "Reserved rootfs build CA path is not a regular file"
+        [[ ! -e "$cleanup_marker" && ! -L "$cleanup_marker" ]] || die "Reserved rootfs build CA cleanup marker already exists"
+        sudo mv -- "$temporary_ca" "$cleanup_marker"
+    fi
+    if [[ -e "$cleanup_marker" || -L "$cleanup_marker" ]]; then
+        [[ -f "$cleanup_marker" && ! -L "$cleanup_marker" ]] || die "Reserved rootfs build CA cleanup marker is not a regular file"
+        sudo LANG=C chroot "$FILESYSTEM_ROOT" update-ca-certificates --fresh
+        sudo rm -- "$cleanup_marker"
     fi
 }
 
@@ -174,6 +206,8 @@ sudo mount proc /proc -t proc || true
 ## Build the host debian base system
 echo '[INFO] Build host debian base system...'
 TARGET_PATH=$TARGET_PATH scripts/build_debian_base_system.sh $CONFIGURED_ARCH $IMAGE_DISTRO $FILESYSTEM_ROOT $http_proxy
+
+sonic_prepare_rootfs_build_ca
 
 # Prepare buildinfo
 sudo SONIC_VERSION_CACHE=${SONIC_VERSION_CACHE} \
@@ -991,6 +1025,8 @@ sudo LANG=C chroot $FILESYSTEM_ROOT bash -c 'rm -rf /usr/share/doc/* /usr/share/
 sudo LANG=C chroot $FILESYSTEM_ROOT pip3 cache purge
 
 run_organization_build_hook pre-finalization
+
+sonic_remove_rootfs_build_ca
 
 ## Umount all
 echo '[INFO] Umount all'
