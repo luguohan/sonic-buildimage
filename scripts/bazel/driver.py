@@ -76,7 +76,6 @@ def make(request, targets, variables=None, environment=None, assume_old=()):
     command = ["make", "-f", "slave.mk", "-f", "bazel/native.mk", "--no-print-directory", "-j" + str(request["jobs"])]
     values = dict(request["_native_make_variables"])
     values.update(variables or {})
-    values.update({"SONIC_DPKG_CACHE_METHOD": "none", "SONIC_DPKG_CACHE_METHOD_OVERRIDE": "none"})
     values["SONIC_BUILD_TARGET"] = targets[-1]
     command.extend(name + "=" + str(value) for name, value in values.items())
     command.extend("--assume-old=" + path for path in sorted(set(assume_old)))
@@ -563,7 +562,6 @@ def main():
         raise RuntimeError("native snapshot identity does not match the launcher request")
     request["_native_environment"], request["_private_environment"], request["_native_make_variables"] = capture_environment()
     request["_native_make_variables"].update({key: str(value) for key, value in request["make_variables"].items()})
-    request["_native_make_variables"].update({"SONIC_DPKG_CACHE_METHOD": "none", "SONIC_DPKG_CACHE_METHOD_OVERRIDE": "none"})
     image = "sonic-vs.img.gz" if request["target"] == "vs-kvm" else "sonic-vs.bin"
     inv = inventory(request, image)
     owned = selected_owned(request, inv)

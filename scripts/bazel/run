@@ -141,7 +141,8 @@ def build(args):
         "BUILD_TIMESTAMP": timestamp, "SONIC_IMAGE_VERSION": version,
         "SOURCE_DATE_EPOCH": epoch,
         "BUILD_HOSTNAME": "sonic-bazel-local",
-        "SONIC_DPKG_CACHE_METHOD": "none", "SONIC_DPKG_CACHE_METHOD_OVERRIDE": "none",
+        "SONIC_DPKG_CACHE_METHOD": args.native_dpkg_cache_method,
+        "SONIC_DPKG_CACHE_METHOD_OVERRIDE": args.native_dpkg_cache_method,
         "SONIC_DPKG_CACHE_SOURCE": str(native_state / "native-cache"),
         "SONIC_VERSION_CACHE_METHOD": "rcache",
         "SONIC_VERSION_CACHE_SOURCE": str(native_state / "native-cache/vcache"),
@@ -182,6 +183,10 @@ def main():
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--bazel-arg", action="append", default=[])
     parser.add_argument("--reprepare", action="store_true", help="recheck native prerequisite builds")
+    parser.add_argument(
+        "--native-dpkg-cache-method", choices=("none", "rwcache"), default="none",
+        help="package cache mode for native preparation (default: none)",
+    )
     args = parser.parse_args()
     if args.jobs < 1:
         parser.error("--jobs must be positive")

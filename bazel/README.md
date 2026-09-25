@@ -32,6 +32,13 @@ Use repeated `--bazel-arg=--option=value` arguments for Bazel build options.
 `--reprepare` asks native Make to recheck its prerequisite targets before
 running Bazel.
 
+Use `--native-dpkg-cache-method rwcache` to let native preparation read and
+populate SONiC's existing package cache. The default is `none`, and the existing
+SONiC check for matching slave tags applies to `rwcache`. Native stages owned
+by Bazel always disable the native package cache. For matched benchmarks, use
+`--native-dpkg-cache-method none` and set `SONIC_DPKG_CACHE_METHOD=none` and
+`SONIC_DPKG_CACHE_METHOD_OVERRIDE=none` for the native comparison run.
+
 The host needs the normal public SONiC build prerequisites, including Git,
 Make, Docker, and `j2` from `jinjanator`. The launcher builds or reuses the
 public Trixie `sonic-slave` image. The Docker environment must support the
