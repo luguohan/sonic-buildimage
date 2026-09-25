@@ -1022,6 +1022,11 @@ fi
 
 sudo mkdir $FILESYSTEM_ROOT/target
 sudo mount --bind target $FILESYSTEM_ROOT/target
+if [[ $SONIC_BAZEL_BUILD_STAGE == image &&
+      $MULTIARCH_QEMU_ENVIRON != y && $CROSS_BUILD_ENVIRON != y ]]; then
+    # Wait for the Docker daemon started by the Bazel image stage before loading containers.
+    sudo LANG=C DOCKER_HOST="$DOCKER_HOST" chroot "$FILESYSTEM_ROOT" /bin/bash -s -- 60 < scripts/wait_for_docker.sh
+fi
 sudo LANG=C DOCKER_HOST="$DOCKER_HOST" chroot $FILESYSTEM_ROOT docker info
 
 {% for docker_installation_target in installer_images.strip().split() -%}
