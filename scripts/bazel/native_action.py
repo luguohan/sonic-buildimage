@@ -13,7 +13,9 @@ import json
 import os
 from pathlib import Path
 import re
+import resource
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -552,6 +554,83 @@ def cleanup_host_root(root, environment):
     )
 
 
+def image_worker_limits():
+    identifiers = sorted({
+        getattr(resource, name) for name in dir(resource)
+        if name.startswith("RLIMIT_") and isinstance(getattr(resource, name), int)
+    })
+    return [[identifier, *resource.getrlimit(identifier)] for identifier in identifiers]
+
+
+def run_image_stage(command, root, environment):
+    """Run image composition with owned processes and private mounts."""
+    if os.getresuid() != (os.getuid(),) * 3 or os.getresgid() != (os.getgid(),) * 3:
+        raise RuntimeError("image worker requires ordinary build-user credentials")
+    root_info = root.stat()
+    previous_umask = os.umask(0)
+    os.umask(previous_umask)
+    request = {
+        "schema": 1, "stage": "image", "cwd": str(root),
+        "cwd_device": root_info.st_dev, "cwd_inode": root_info.st_ino,
+        "command": command, "environment": environment,
+        "uid": os.getuid(), "gid": os.getgid(), "groups": os.getgroups(),
+        "umask": previous_umask, "rlimits": image_worker_limits(),
+    }
+    process = None
+    interrupted = None
+    previous_handlers = {}
+
+    def interrupt(signum, _frame):
+        nonlocal interrupted
+        if interrupted is None:
+            interrupted = signum
+
+    # The helper reads this anonymous file before entering namespaces.  This
+    # preserves stdin and keeps the exact build environment out of argv.
+    with tempfile.TemporaryFile(mode="w+b") as request_file:
+        os.fchmod(request_file.fileno(), 0o600)
+        request_file.write(canonical_json(request))
+        request_file.flush()
+        request_file.seek(0)
+        request_path = "/proc/" + str(os.getpid()) + "/fd/" + str(request_file.fileno())
+        try:
+            for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                previous_handlers[signum] = signal.signal(signum, interrupt)
+            previous_handlers[signal.SIGCHLD] = signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+            process = subprocess.Popen(
+                ["sudo", "-n", "--", "python3", "-B", "scripts/bazel/native/image_worker.py", request_path],
+                cwd=root, env=environment, start_new_session=True,
+            )
+            cancellation_sent = False
+            while True:
+                if interrupted is not None and not cancellation_sent:
+                    process.send_signal(signal.SIGTERM)
+                    cancellation_sent = True
+                try:
+                    process.wait(timeout=0.2)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+        except BaseException:
+            if process is not None:
+                process.send_signal(signal.SIGTERM)
+            raise
+        finally:
+            try:
+                if process is not None:
+                    # Keep the caller's action lock until PID 1 has been reaped.
+                    process.wait()
+            finally:
+                for signum, handler in previous_handlers.items():
+                    signal.signal(signum, handler)
+    if interrupted is not None:
+        raise RuntimeError("image worker interrupted by signal " + str(interrupted))
+    if process is None:
+        raise RuntimeError("image worker did not start")
+    if process.returncode:
+        raise subprocess.CalledProcessError(process.returncode, command)
+
+
 def copy_file(source, destination):
     if not source.is_file():
         raise RuntimeError("required action input is missing: " + str(source))
@@ -641,7 +720,12 @@ def build(args):
         command.append(spec["target"])
         print("Running native SONiC " + spec["stage"] + " stage for " + spec["target"], flush=True)
         try:
-            subprocess.run(command, cwd=root, env=environment, check=True)
+            if spec["stage"] == "image":
+                if spec.get("context_mounts"):
+                    raise RuntimeError("image worker does not support Docker context mounts")
+                run_image_stage(command, root, environment)
+            else:
+                subprocess.run(command, cwd=root, env=environment, check=True)
         finally:
             cleanup_context_mounts(root, spec.get("context_mounts", {}), environment)
             if spec["stage"] in {"host", "image"}:
