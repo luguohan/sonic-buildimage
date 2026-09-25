@@ -43,16 +43,22 @@ sonic_prepare_rootfs_build_ca()
     local temporary_ca="$FILESYSTEM_ROOT/usr/local/share/ca-certificates/sonic-build-temporary-ca.crt"
     local cleanup_marker="$FILESYSTEM_ROOT/usr/local/share/ca-certificates/sonic-build-temporary-ca.cleanup"
     local rootfs_bundle="$FILESYSTEM_ROOT/etc/ssl/certs/ca-certificates.crt"
+    local temporary_apt_config="$FILESYSTEM_ROOT/etc/apt/apt.conf.d/99sonic-build-ca"
     [[ ! -e "$temporary_ca" && ! -L "$temporary_ca" && ! -e "$cleanup_marker" && ! -L "$cleanup_marker" ]] || die "Reserved rootfs build CA path already exists"
+    [[ ! -e "$temporary_apt_config" && ! -L "$temporary_apt_config" ]] || die "Reserved rootfs build APT config already exists"
     sudo install -D -m 0644 "$SONIC_BUILD_CA_CERT" "$temporary_ca"
     sudo install -D -m 0644 /etc/ssl/certs/ca-certificates.crt "$rootfs_bundle"
     sudo sh -c 'cat "$1" >> "$2"' -- "$SONIC_BUILD_CA_CERT" "$rootfs_bundle"
+    # APT's OpenSSL default path may not exist until openssl is installed.
+    sudo install -D -m 0644 /dev/null "$temporary_apt_config"
+    printf '%s\n' 'Acquire::https::CaInfo "/etc/ssl/certs/ca-certificates.crt";' | sudo tee "$temporary_apt_config" > /dev/null
 }
 
 sonic_remove_rootfs_build_ca()
 {
     local temporary_ca="$FILESYSTEM_ROOT/usr/local/share/ca-certificates/sonic-build-temporary-ca.crt"
     local cleanup_marker="$FILESYSTEM_ROOT/usr/local/share/ca-certificates/sonic-build-temporary-ca.cleanup"
+    local temporary_apt_config="$FILESYSTEM_ROOT/etc/apt/apt.conf.d/99sonic-build-ca"
     if [[ -e "$temporary_ca" || -L "$temporary_ca" ]]; then
         [[ -f "$temporary_ca" && ! -L "$temporary_ca" ]] || die "Reserved rootfs build CA path is not a regular file"
         [[ ! -e "$cleanup_marker" && ! -L "$cleanup_marker" ]] || die "Reserved rootfs build CA cleanup marker already exists"
@@ -61,6 +67,12 @@ sonic_remove_rootfs_build_ca()
     if [[ -e "$cleanup_marker" || -L "$cleanup_marker" ]]; then
         [[ -f "$cleanup_marker" && ! -L "$cleanup_marker" ]] || die "Reserved rootfs build CA cleanup marker is not a regular file"
         sudo LANG=C chroot "$FILESYSTEM_ROOT" update-ca-certificates --fresh
+    fi
+    if [[ -e "$temporary_apt_config" || -L "$temporary_apt_config" ]]; then
+        [[ -f "$temporary_apt_config" && ! -L "$temporary_apt_config" ]] || die "Reserved rootfs build APT config is not a regular file"
+        sudo rm -- "$temporary_apt_config"
+    fi
+    if [[ -e "$cleanup_marker" || -L "$cleanup_marker" ]]; then
         sudo rm -- "$cleanup_marker"
     fi
 }
