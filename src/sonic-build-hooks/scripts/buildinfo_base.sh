@@ -163,6 +163,7 @@ download_packages()
     local real_version=
     local SRC_FILENAME=
     local DST_FILENAME=
+    local real_command_required=n
 
     for (( i=0; i<${#parameters[@]}; i++ ))
     do
@@ -176,6 +177,7 @@ download_packages()
 
             # Skip to use the proxy, if the url has already used the proxy server
             if [[ ! -z "${URL_PREFIX}" && $url == ${URL_PREFIX}* ]]; then
+                real_command_required=y
                 continue
             fi
             local result=0
@@ -242,9 +244,10 @@ download_packages()
         fi
     done
 
-    # Skip the real command if all the files are loaded from cache
+    # Skip the real command if all the files are loaded from cache. URLs that
+    # already use the proxy still need to be downloaded by the real command.
     local result=0
-    if [[ ! -z "$(get_version_cache_option)" && ${#SRC_FILENAMES[@]} -eq 0 ]]; then
+    if [[ ! -z "$(get_version_cache_option)" && ${#SRC_FILENAMES[@]} -eq 0 && "$real_command_required" == n ]]; then
         return $result
     fi
 
