@@ -641,8 +641,11 @@ def copy_file(source, destination):
                 return
         except OSError:
             pass
-        if source.stat().st_size == destination.stat().st_size and digest_file(source) == digest_file(destination):
-            destination.chmod(stat.S_IMODE(source.stat().st_mode))
+        if (
+            source.stat().st_size == destination.stat().st_size
+            and stat.S_IMODE(source.stat().st_mode) == stat.S_IMODE(destination.stat().st_mode)
+            and digest_file(source) == digest_file(destination)
+        ):
             return
     with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as stream:
         temporary = Path(stream.name)
