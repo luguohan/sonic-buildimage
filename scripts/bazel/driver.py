@@ -379,13 +379,64 @@ def starlark(value):
     return json.dumps(value, indent=4, sort_keys=True)
 
 
-def oci_container_rules(inv, owned, retained, baseline_label, archive_labels):
+def native_stage_spec(request, inv, stage, target, outputs, host_snapshot=None, assume_old=(), context_mounts=None):
+    spec = {
+        "schema": 1, "stage": stage, "target": target, "outputs": outputs,
+        "environment": {
+            "SONIC_BAZEL_SOURCE_COMMIT": request["source_commit"],
+            "SONIC_BAZEL_SOURCE_BRANCH": request["source_branch"],
+            "SOURCE_DATE_EPOCH": str(request["source_date_epoch"]),
+        },
+        "make_variables": {**request["_native_make_variables"], "BAZEL_IMAGE": inv["image"]},
+        "assume_old": sorted(set(assume_old)),
+        "context_mounts": context_mounts or {},
+    }
+    if host_snapshot:
+        spec["host_snapshot"] = host_snapshot
+    return spec
+
+
+def container_stage_specs(request, inv, owned):
+    result = {}
+    for name in owned:
+        item = inv["containers"][name]
+        if inv["swss_dbg"] in item.get("depends", []):
+            raise RuntimeError("the OCI container graph does not support an installed SWSS debug package: " + name)
+        mounts = container_context_mounts(inv, [name])
+        if len(mounts) != 4:
+            raise RuntimeError("Bazel-owned container lacks native context paths: " + name)
+        result[name] = native_stage_spec(
+            request, inv, "container", "target/" + name,
+            {"containers/" + name: "target/" + name}, context_mounts=mounts,
+        )
+    return result
+
+
+def container_input_contract(request, inv, owned, artifacts, manifest):
+    static_inputs = {path: item["sha256"] for path, item in artifacts.items()}
+    dynamic_inputs = sorted("target/debs/trixie/" + name for name in (inv["swss"], inv["swss_dbg"]))
+    dependencies = {
+        name: sorted({"target/" + dependency for dependency in
+                     inv["containers"][name]["load_dockers"] + inv["containers"][name]["after"]
+                     if dependency in owned})
+        for name in owned
+    }
+    return oci_container.container_input_contract(
+        manifest, container_stage_specs(request, inv, owned), static_inputs, dynamic_inputs, dependencies,
+    )
+
+
+def oci_container_rules(inv, owned, retained, baseline_label, archive_labels, contract_label):
     def rule(kind, attributes):
         return kind + "(\n" + "\n".join(
             "    " + key + " = " + starlark(value) + "," for key, value in attributes.items()
         ) + "\n)"
 
-    lines = []
+    lines = [rule("validate_retained_contract", {
+        "name": "oci_input_contract", "baseline": contract_label,
+        "current": ":container-inputs.json", "baseline_sha256": retained["contract"]["sha256"],
+        "tool": "//tools:oci_container.py",
+    })]
     seeds = []
     names = {}
     for name in owned:
@@ -397,6 +448,7 @@ def oci_container_rules(inv, owned, retained, baseline_label, archive_labels):
         archive = retained["archives"][name]
         lines.append(rule("retained_oci_layout", {
             "name": layout, "src": archive_labels[name], "baseline_deb": baseline_label,
+            "contract": ":oci_input_contract",
             "archive_sha256": archive["sha256"], "baseline_sha256": retained["package"]["sha256"],
             "image_name": archive["image_name"], "tool": "//tools:oci_container.py",
         }))
@@ -433,7 +485,7 @@ def oci_container_rules(inv, owned, retained, baseline_label, archive_labels):
     return lines
 
 
-def generate_workspace(request, inv, owned, artifacts, manifest, retained=None):
+def generate_workspace(request, inv, owned, artifacts, manifest, retained=None, contract=None):
     WORKSPACE.mkdir(parents=True, exist_ok=True)
     write_text(WORKSPACE / ".bazelversion", (ROOT / ".bazelversion").read_text())
     module = 'module(name = "sonic_vs_local")\n\nbazel_dep(name = "rules_cc", version = "0.1.1")\n'
@@ -464,6 +516,8 @@ def generate_workspace(request, inv, owned, artifacts, manifest, retained=None):
     write_text(WORKSPACE / "tools/BUILD.bazel", "exports_files(" + starlark(tools) + ")\n")
     write_text(WORKSPACE / "image/defs.bzl", (ROOT / "bazel/defs.bzl").read_text())
     write_json(WORKSPACE / "image/source-manifest.json", manifest)
+    if contract is not None:
+        write_text(WORKSPACE / "image/container-inputs.json", oci_container.contract_bytes(contract).decode())
     inputs_dir = WORKSPACE / "inputs"
     inputs_dir.mkdir(parents=True, exist_ok=True)
     labels = {}
@@ -482,9 +536,13 @@ def generate_workspace(request, inv, owned, artifacts, manifest, retained=None):
     for logical in sorted(artifacts):
         labels[expose_input(logical)] = logical
     baseline_label = None
+    contract_label = None
     archive_labels = {}
     if retained:
+        if contract is None:
+            raise RuntimeError("retained OCI inputs require the current container input contract")
         baseline_label = expose_input(str((STATE / retained["package"]["path"]).relative_to(ROOT)))
+        contract_label = expose_input(str((STATE / retained["contract"]["path"]).relative_to(ROOT)))
         for name in owned:
             archive_labels[name] = expose_input(str((STATE / retained["archives"][name]["path"]).relative_to(ROOT)))
     for path in inputs_dir.iterdir():
@@ -499,7 +557,7 @@ def generate_workspace(request, inv, owned, artifacts, manifest, retained=None):
     ]
     if retained:
         lines = [
-            'load(":oci_defs.bzl", "deterministic_gzip", "retained_oci_layout", "swss_package_overlay")',
+            'load(":oci_defs.bzl", "deterministic_gzip", "retained_oci_layout", "swss_package_overlay", "validate_retained_contract")',
             'load("@rules_img//img:convert.bzl", "image_manifest_from_oci_layout")',
             'load("@rules_img//img:image.bzl", "image_manifest")',
             'load("@rules_img//img:layer.bzl", "layer_from_tar")',
@@ -507,23 +565,8 @@ def generate_workspace(request, inv, owned, artifacts, manifest, retained=None):
         ] + lines
         created = datetime.datetime.fromtimestamp(request["source_date_epoch"], datetime.timezone.utc)
         write_text(WORKSPACE / "image/image-created.txt", created.strftime("%Y-%m-%dT%H:%M:%SZ") + "\n")
-    stage_environment = {
-        "SONIC_BAZEL_SOURCE_COMMIT": request["source_commit"],
-        "SONIC_BAZEL_SOURCE_BRANCH": request["source_branch"],
-        "SOURCE_DATE_EPOCH": str(request["source_date_epoch"]),
-    }
-    make_variables = dict(request["_native_make_variables"])
-    make_variables["BAZEL_IMAGE"] = inv["image"]
-
     def add_stage(name, stage, target, inputs, outputs, mnemonic, host_snapshot=None, assume_old=(), context_mounts=None):
-        spec = {
-            "schema": 1, "stage": stage, "target": target, "outputs": outputs,
-            "environment": stage_environment, "make_variables": make_variables,
-            "assume_old": sorted(set(assume_old)),
-            "context_mounts": context_mounts or {},
-        }
-        if host_snapshot:
-            spec["host_snapshot"] = host_snapshot
+        spec = native_stage_spec(request, inv, stage, target, outputs, host_snapshot, assume_old, context_mounts)
         spec_name = name + ".json"
         write_json(WORKSPACE / "image" / spec_name, spec)
         lines.append("sonic_native_stage(\n    name = " + starlark(name) + ",\n    spec = " + starlark(":" + spec_name) +
@@ -536,8 +579,9 @@ def generate_workspace(request, inv, owned, artifacts, manifest, retained=None):
     }
     container_labels = {name: ":containers/" + name for name in owned}
     if retained:
-        lines.extend(oci_container_rules(inv, owned, retained, baseline_label, archive_labels))
+        lines.extend(oci_container_rules(inv, owned, retained, baseline_label, archive_labels, contract_label))
     else:
+        specs = container_stage_specs(request, inv, owned)
         for name in owned:
             rule_name = "container_" + name.replace("-", "_").replace(".", "_")
             output_path = "containers/" + name
@@ -547,10 +591,9 @@ def generate_workspace(request, inv, owned, artifacts, manifest, retained=None):
             for dependency in item["load_dockers"] + item["after"]:
                 if dependency in owned:
                     inputs[":containers/" + dependency] = "target/" + dependency
-            context_mounts = container_context_mounts(inv, [name])
-            if len(context_mounts) != 4:
-                raise RuntimeError("Bazel-owned container lacks native context paths: " + name)
-            add_stage(rule_name, "container", "target/" + name, inputs, {output_path: "target/" + name}, "SonicContainer", context_mounts=context_mounts)
+            add_stage(rule_name, "container", "target/" + name, inputs, {output_path: "target/" + name}, "SonicContainer", context_mounts=specs[name]["context_mounts"])
+    if container_labels:
+        lines.append('filegroup(name = "owned_container_archives", srcs = ' + starlark(list(container_labels.values())) + ')')
     if "docker-orchagent.gz" in container_labels:
         lines.append('alias(name = "swss_container", actual = ":containers/docker-orchagent.gz")')
     if request["target"] in {"vs", "vs-kvm"}:
@@ -585,7 +628,7 @@ def generate_workspace(request, inv, owned, artifacts, manifest, retained=None):
     write_text(WORKSPACE / "image/BUILD.bazel", "\n\n".join(lines) + "\n")
 
 
-def build(request, inv, manifest, retained=None):
+def build(request, inv, manifest, retained=None, contract=None):
     target = {
         "swss": "//swss:swss_deb", "container": "//image:swss_container",
         "vs": "//image:sonic_vs", "vs-kvm": "//image:sonic_vs_kvm",
@@ -601,12 +644,16 @@ def build(request, inv, manifest, retained=None):
     bazel = ["bazel", "--nosystem_rc", "--nohome_rc"]
     environment = build_environment(request)
     environment["PWD"] = str(WORKSPACE)
+    owned = selected_owned(request, inv)
+    if owned and contract is None:
+        raise RuntimeError("container builds require the current input contract")
     # cquery reports paths without materializing cached outputs. Request every
     # collected artifact as a top-level build output before querying its path.
     metadata_label = "//image:oci_overlay_metadata"
-    validation_labels = []
+    archive_label = "//image:owned_container_archives"
+    validation_labels = [archive_label] if owned else []
     if retained:
-        validation_labels = [metadata_label] + ["//image:containers/" + name for name in selected_owned(request, inv)]
+        validation_labels.append(metadata_label)
     command = bazel + [
         "build", "--profile=" + str(log_dir / "profile.json.gz"),
         "--execution_log_json_file=" + str(log_dir / "execution.json"),
@@ -614,8 +661,8 @@ def build(request, inv, manifest, retained=None):
     run(command, cwd=WORKSPACE, env=environment)
     artifact_dir = STATE / "artifacts" / request["target"]
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    outputs = {}
-    for label, expected_count in labels.items():
+
+    def query_paths(label, expected_count):
         result = subprocess.check_output(
             bazel + ["cquery", "--output=files"] + request["bazel_args"] + [label],
             cwd=WORKSPACE, env=environment, text=True,
@@ -623,34 +670,62 @@ def build(request, inv, manifest, retained=None):
         paths = [WORKSPACE / line.strip() for line in result.splitlines() if line.strip()]
         if len(paths) != expected_count or any(not path.is_file() for path in paths):
             raise RuntimeError("Bazel did not produce the expected outputs for " + label)
+        return paths
+
+    outputs = {}
+    produced_paths = {}
+    for label, expected_count in labels.items():
+        paths = query_paths(label, expected_count)
         for path in paths:
             destination = artifact_dir / path.name
             native_action.copy_file(path, destination)
             outputs[path.name] = {"sha256": native_action.digest_file(destination), "size": destination.stat().st_size, "label": label}
+            produced_paths[path.name] = path
+    archive_paths = {}
+    if owned:
+        archive_paths = {path.name: path for path in query_paths(archive_label, len(owned))}
+        if set(archive_paths) != set(owned):
+            raise RuntimeError("Bazel did not produce the selected owned container archives")
     report = {
         "schema": 1, "target": request["target"], "buildimage_commit": request["source_commit"],
         "buildimage_branch": request["source_branch"], "swss_commit": request["swss_commit"],
         "swss_source_digest": request["swss_digest"], "source_date_epoch": request["source_date_epoch"],
         "environment_digest": manifest["environment_digest"], "image_version": inv["image_version"],
+        "source_manifest_sha256": native_action.digest_file(WORKSPACE / "image/source-manifest.json"),
         "owned_containers": inv["owned_dockers"], "outputs": outputs,
         "profile": str(log_dir / "profile.json.gz"), "execution_log": str(log_dir / "execution.json"),
     }
     report["container_backend"] = "oci" if retained else ("native-docker" if request["target"] != "swss" else "none")
+    if contract is not None:
+        destination = artifact_dir / "container-inputs.json"
+        native_action.copy_file(WORKSPACE / "image/container-inputs.json", destination)
+        report["container_input_contract"] = {
+            "path": str(destination), "sha256": native_action.digest_file(destination),
+        }
     if retained:
-        result = subprocess.check_output(
-            bazel + ["cquery", "--output=files"] + request["bazel_args"] + [metadata_label],
-            cwd=WORKSPACE, env=environment, text=True,
-        )
-        paths = [WORKSPACE / line.strip() for line in result.splitlines() if line.strip()]
-        if len(paths) != 1 or not paths[0].is_file():
-            raise RuntimeError("Bazel did not produce the OCI overlay metadata")
+        paths = query_paths(metadata_label, 1)
         destination = artifact_dir / paths[0].name
         native_action.copy_file(paths[0], destination)
+        receipt_path = STATE / retained["receipt_path"]
         report["oci"] = {
             "rules_img_version": "0.3.22",
-            "retained_receipt": str(STATE / "oci-retained/receipt.json"),
-            "retained_receipt_sha256": native_action.digest_file(STATE / "oci-retained/receipt.json"),
+            "retained_receipt": str(receipt_path),
+            "retained_receipt_sha256": native_action.digest_file(receipt_path),
             "overlay_metadata": {"path": str(destination), "sha256": native_action.digest_file(destination)},
+        }
+    elif owned:
+        captured = oci_container.capture_retained_inputs(
+            STATE, inv, owned, contract, {**archive_paths, inv["swss"]: produced_paths[inv["swss"]]}, {
+                "kind": "successful-bazel-native-build",
+                "buildimage_commit": request["source_commit"], "swss_commit": request["swss_commit"],
+                "swss_source_digest": request["swss_digest"], "image_version": inv["image_version"],
+                "source_manifest_sha256": report["source_manifest_sha256"],
+                "profile": report["profile"], "execution_log": report["execution_log"],
+            },
+        )
+        receipt_path = STATE / captured["receipt_path"]
+        report["retained_for_oci"] = {
+            "receipt": str(receipt_path), "sha256": native_action.digest_file(receipt_path),
         }
     write_json(artifact_dir / "build-manifest.json", report)
     print("Bazel artifacts: " + str(artifact_dir), flush=True)
@@ -678,19 +753,15 @@ def main():
         print("Native prerequisites are ready for the fresh action slave.", flush=True)
         return
     artifacts = prepared_artifacts(request, inv, owned)
-    retained = None
-    if owned:
-        retained = oci_container.capture_retained_inputs(ROOT, STATE, inv, sorted(inv["owned_dockers"]), {
-            "request_buildimage_commit": request["source_commit"],
-            "request_swss_commit": request["swss_commit"],
-            "request_swss_source_digest": request["swss_digest"],
-        })
-        print("Container construction: " + ("retained OCI layers" if retained else "native Docker recipes"), flush=True)
     prepare_action_environment(request, inv, owned, artifacts)
     prepare_swss(request, inv)
     manifest = prepare_environment(request, inv, artifacts)
-    generate_workspace(request, inv, owned, artifacts, manifest, retained)
-    build(request, inv, manifest, retained)
+    contract = container_input_contract(request, inv, owned, artifacts, manifest) if owned else None
+    retained = oci_container.load_retained_inputs(STATE, inv, owned, contract) if owned else None
+    if owned:
+        print("Container construction: " + ("verified retained OCI layers" if retained else "native Docker baseline for the current inputs"), flush=True)
+    generate_workspace(request, inv, owned, artifacts, manifest, retained, contract)
+    build(request, inv, manifest, retained, contract)
 
 
 if __name__ == "__main__":

@@ -14,6 +14,40 @@ SwssOverlayInfo = provider(
     },
 )
 
+def _validate_retained_contract_impl(ctx):
+    stamp = ctx.actions.declare_file(ctx.label.name + ".stamp")
+    args = ctx.actions.args()
+    args.add("contract")
+    args.add("--baseline", ctx.file.baseline.path)
+    args.add("--current", ctx.file.current.path)
+    args.add("--baseline-sha256", ctx.attr.baseline_sha256)
+    args.add("--stamp", stamp.path)
+    ctx.actions.run(
+        executable = ctx.executable.tool,
+        arguments = [args],
+        inputs = [ctx.file.baseline, ctx.file.current],
+        outputs = [stamp],
+        mnemonic = "SonicOciContract",
+        progress_message = "Validating retained OCI container inputs %{label}",
+        execution_requirements = {"block-network": "1"},
+    )
+    return [DefaultInfo(files = depset([stamp]))]
+
+validate_retained_contract = rule(
+    implementation = _validate_retained_contract_impl,
+    attrs = {
+        "baseline": attr.label(allow_single_file = True, mandatory = True),
+        "baseline_sha256": attr.string(mandatory = True),
+        "current": attr.label(allow_single_file = True, mandatory = True),
+        "tool": attr.label(
+            allow_files = True,
+            cfg = "exec",
+            executable = True,
+            mandatory = True,
+        ),
+    },
+)
+
 def _retained_oci_layout_impl(ctx):
     layout = ctx.actions.declare_directory(ctx.label.name + ".oci")
     metadata = ctx.actions.declare_file(ctx.label.name + ".metadata.json")
@@ -29,7 +63,7 @@ def _retained_oci_layout_impl(ctx):
     ctx.actions.run(
         executable = ctx.executable.tool,
         arguments = [args],
-        inputs = [ctx.file.src, ctx.file.baseline_deb],
+        inputs = [ctx.file.src, ctx.file.baseline_deb, ctx.file.contract],
         outputs = [layout, metadata],
         mnemonic = "SonicOciExtract",
         progress_message = "Extracting retained OCI layout %{label}",
@@ -47,6 +81,7 @@ retained_oci_layout = rule(
         "archive_sha256": attr.string(mandatory = True),
         "baseline_deb": attr.label(allow_single_file = True, mandatory = True),
         "baseline_sha256": attr.string(mandatory = True),
+        "contract": attr.label(allow_single_file = True, mandatory = True),
         "image_name": attr.string(mandatory = True),
         "src": attr.label(allow_single_file = True, mandatory = True),
         "tool": attr.label(

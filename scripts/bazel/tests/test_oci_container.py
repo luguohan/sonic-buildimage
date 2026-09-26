@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Behavioral tests for retained OCI extraction and compatible SWSS updates."""
 
+import copy
 import gzip
 import hashlib
 import io
@@ -176,6 +177,41 @@ def write_image(path, image_name, package, binary_override=None, tag=None,
             "index": index, "layers": layer_blobs, "layer_types": layer_types}
 
 
+def contract_fixture():
+    manifest = {
+        "schema": 1, "digest": "d" * 64, "environment_digest": "e" * 64,
+        "source": {
+            "entries": {
+                "dockers/docker-test/Dockerfile.j2": {"kind": "file", "sha256": "a" * 64},
+                "scripts/bazel/driver.py": {"kind": "file", "sha256": "b" * 64},
+                "scripts/bazel/tests/test_bazel_graph.py": {"kind": "file", "sha256": "c" * 64},
+                "bazel/README.md": {"kind": "file", "sha256": "d" * 64},
+            },
+            "repositories": [
+                {"path": ".", "commit": "1" * 40, "branch": "bazel", "role": "root"},
+                {"path": "src/dependency", "commit": "2" * 40, "branch": "HEAD", "role": "submodule"},
+            ],
+        },
+        "native_make_variables": {"BUILD_TIMESTAMP": "old", "SONIC_IMAGE_VERSION": "old",
+                                  "SOURCE_DATE_EPOCH": "1", "ENABLE_ASAN": "n"},
+        "environment": {"slave_image_id": "sha256:" + "3" * 64, "packages": "old"},
+        "native_environment": {"PATH": "/usr/bin"},
+        "dependency_artifacts": {"target/debs/trixie/libc6.deb": "4" * 64},
+        "private_environment_sha256": "5" * 64,
+    }
+    specs = {"docker-test.gz": {
+        "schema": 1, "stage": "container", "target": "target/docker-test.gz",
+        "outputs": {"containers/docker-test.gz": "target/docker-test.gz"},
+        "environment": {"SONIC_BAZEL_SOURCE_COMMIT": "1" * 40, "SONIC_BAZEL_SOURCE_BRANCH": "bazel",
+                        "SOURCE_DATE_EPOCH": "1"},
+        "make_variables": {**manifest["native_make_variables"], "BAZEL_IMAGE": "sonic-vs.bin"},
+        "assume_old": [], "context_mounts": {"dockers/docker-test/debs": "target/debs/trixie"},
+    }}
+    static_inputs = {"target/debs/trixie/libc6.deb": "4" * 64}
+    dynamic_inputs = ["target/debs/trixie/swss-dbg_1.0.0_amd64.deb", "target/debs/trixie/swss_1.0.0_amd64.deb"]
+    return [manifest, specs, static_inputs, dynamic_inputs, {"docker-test.gz": []}]
+
+
 class OciContainerTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="sonic-oci-test-")
@@ -304,19 +340,84 @@ class OciContainerTest(unittest.TestCase):
                 self.assertIn(message, result.stderr)
                 self.assertFalse(layout.exists())
 
-    def test_capture_snapshots_private_read_only_files_and_reuses_receipt(self):
-        root = self.root / "source"
+    def test_container_contract_allows_only_declared_metadata_changes(self):
+        inputs = contract_fixture()
+        original = copy.deepcopy(inputs)
+        baseline = oci_container.container_input_contract(*inputs)
+        self.assertEqual(inputs, original)
+        changed = copy.deepcopy(inputs)
+        changed[0]["digest"] = "6" * 64
+        changed[0]["environment_digest"] = "7" * 64
+        changed[0]["source"]["entries"]["scripts/bazel/driver.py"]["sha256"] = "8" * 64
+        changed[0]["source"]["entries"]["bazel/oci_defs.bzl"] = {"kind": "file", "sha256": "9" * 64}
+        changed[0]["source"]["entries"]["scripts/bazel/oci_container.py"] = {"kind": "file", "sha256": "a" * 64}
+        changed[0]["source"]["entries"]["scripts/bazel/tests/new_test.py"] = {"kind": "file", "sha256": "b" * 64}
+        changed[0]["source"]["entries"].pop("bazel/README.md")
+        changed[0]["source"]["repositories"][0]["commit"] = "3" * 40
+        for variables in (changed[0]["native_make_variables"], changed[1]["docker-test.gz"]["make_variables"]):
+            variables.update({"BUILD_TIMESTAMP": "new", "SONIC_IMAGE_VERSION": "new", "SOURCE_DATE_EPOCH": "2"})
+        changed[1]["docker-test.gz"]["environment"].update({"SONIC_BAZEL_SOURCE_COMMIT": "3" * 40, "SOURCE_DATE_EPOCH": "2"})
+        self.assertEqual(oci_container.container_input_contract(*changed), baseline)
+        mutations = [
+            lambda value: value[0]["source"]["entries"]["dockers/docker-test/Dockerfile.j2"].update({"sha256": "0" * 64}),
+            lambda value: value[0]["source"]["repositories"][0].update({"branch": "other"}),
+            lambda value: value[0]["source"]["repositories"][1].update({"commit": "4" * 40}),
+            lambda value: value[0]["environment"].update({"packages": "new"}),
+            lambda value: value[0].update({"private_environment_sha256": "0" * 64}),
+            lambda value: value[0].update({"future_native_input": "preserved"}),
+            lambda value: value[1]["docker-test.gz"]["make_variables"].update({"ENABLE_ASAN": "y"}),
+            lambda value: value[2].update({"target/debs/trixie/libc6.deb": "0" * 64}),
+        ]
+        for number, mutate in enumerate(mutations):
+            with self.subTest(preserved_input=number):
+                current = copy.deepcopy(changed)
+                mutate(current)
+                self.assertNotEqual(oci_container.container_input_contract(*current), baseline)
+
+    def test_contract_action_requires_canonical_equal_inputs_and_baseline_hash(self):
+        contract = oci_container.container_input_contract(*contract_fixture())
+        data = oci_container.contract_bytes(contract)
+        baseline, current = self.root / "baseline.json", self.root / "current.json"
+        baseline.write_bytes(data)
+        current.write_bytes(data)
+        stamp = self.root / "contract.stamp"
+        self.command("contract", "--baseline", baseline, "--current", current,
+                     "--baseline-sha256", digest(data), "--stamp", stamp)
+        self.assertEqual(json.loads(stamp.read_bytes()), {"schema": 1, "contract_sha256": digest(data)})
+        current.write_bytes(oci_container.contract_bytes({**contract, "future_native_input": "changed"}))
+        result = self.command("contract", "--baseline", baseline, "--current", current,
+                              "--baseline-sha256", digest(data), "--stamp", self.root / "mismatch.stamp", success=False)
+        self.assertIn("current container inputs differ", result.stderr)
+        current.write_bytes(data)
+        result = self.command("contract", "--baseline", baseline, "--current", current,
+                              "--baseline-sha256", "0" * 64, "--stamp", self.root / "hash.stamp", success=False)
+        self.assertIn("SHA-256 mismatch", result.stderr)
+        baseline.write_text(json.dumps(contract, indent=2) + "\n")
+        result = self.command("contract", "--baseline", baseline, "--current", current,
+                              "--baseline-sha256", digest(baseline.read_bytes()), "--stamp", self.root / "encoding.stamp", success=False)
+        self.assertIn("not canonical", result.stderr)
+
+    def test_capture_uses_explicit_outputs_and_contract_keyed_read_only_receipt(self):
+        root = self.root / "bazel-bin"
         state = self.root / "state"
         inv = {"swss": "swss_1.0.0_amd64.deb"}
         owned = ["docker-test.gz"]
-        identity = {"source": "fixture revision"}
-        self.assertIsNone(oci_container.capture_retained_inputs(root, state, inv, owned, identity))
-        package = write_deb(root / "target/debs/trixie" / inv["swss"])
-        image = write_image(root / "target" / owned[0], "docker-test", package)
+        contract = oci_container.container_input_contract(*contract_fixture())
+        provenance = {"kind": "verified-native-execution", "execution_log_sha256": "a" * 64}
+        self.assertIsNone(oci_container.load_retained_inputs(state, inv, owned, contract))
+        package = write_deb(root / "swss" / inv["swss"])
+        image = write_image(root / "image/containers" / owned[0], "docker-test", package)
+        sources = {inv["swss"]: package["path"], owned[0]: image["path"]}
 
-        receipt = oci_container.capture_retained_inputs(root, state, inv, owned, identity)
+        receipt = oci_container.capture_retained_inputs(state, inv, owned, contract, sources, provenance)
 
-        self.assertEqual(receipt["identity"], identity)
+        contract_data = oci_container.contract_bytes(contract)
+        relative = "oci-retained-inputs/" + digest(contract_data)
+        self.assertEqual(receipt["schema"], 2)
+        self.assertEqual(receipt["provenance"], provenance)
+        self.assertEqual(receipt["receipt_path"], relative + "/receipt.json")
+        self.assertEqual(receipt["contract"]["path"], relative + "/container-inputs.json")
+        self.assertEqual((state / receipt["contract"]["path"]).read_bytes(), contract_data)
         self.assertEqual(receipt["package"]["identity"], {"name": "swss", "version": "1.0.0", "architecture": "amd64"})
         self.assertEqual(receipt["archives"][owned[0]]["layer_media_types"], image["layer_types"])
         for original, record in ((package["path"], receipt["package"]),
@@ -326,13 +427,21 @@ class OciContainerTest(unittest.TestCase):
             self.assertNotEqual(retained.stat().st_ino, original.stat().st_ino)
             self.assertFalse(stat.S_IMODE(retained.stat().st_mode) & 0o222)
             self.assertEqual(record["sha256"], digest(retained.read_bytes()))
-        shutil.rmtree(root / "target")
-        repeated = oci_container.capture_retained_inputs(root, state, inv, owned, {"source": "later revision"})
+        repeated = oci_container.capture_retained_inputs(state, inv, owned, contract, sources, provenance)
         self.assertEqual(repeated, receipt)
+        image["path"].write_bytes(b"a different native baseline")
+        with self.assertRaisesRegex(RuntimeError, "different baseline"):
+            oci_container.capture_retained_inputs(state, inv, owned, contract, sources, provenance)
+        shutil.rmtree(root)
+        self.assertEqual(oci_container.load_retained_inputs(state, inv, owned, contract), receipt)
+        different_inputs = contract_fixture()
+        different_inputs[2]["target/debs/trixie/libc6.deb"] = "0" * 64
+        different = oci_container.container_input_contract(*different_inputs)
+        self.assertIsNone(oci_container.load_retained_inputs(state, inv, owned, different))
         retained = state / receipt["archives"][owned[0]]["path"]
         retained.chmod(0o644)
         with self.assertRaisesRegex(RuntimeError, "file identity changed"):
-            oci_container.capture_retained_inputs(root, state, inv, owned, identity)
+            oci_container.load_retained_inputs(state, inv, owned, contract)
 
 
 if __name__ == "__main__":

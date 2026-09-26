@@ -18,6 +18,7 @@ import tempfile
 
 
 SCHEMA = 1
+RECEIPT_SCHEMA = 2
 CHUNK = 1024 * 1024
 MAX_JSON = 16 * 1024 * 1024
 OCI_INDEX = "application/vnd.oci.image.index.v1+json"
@@ -31,6 +32,14 @@ BLOB = re.compile(r"blobs/sha256/([0-9a-f]{64})")
 INFO_PREFIX = "var/lib/dpkg/info/swss."
 INFO_PATHS = {INFO_PREFIX + name for name in ("md5sums", "conffiles", "list")}
 STATUS_PATH = "var/lib/dpkg/status"
+CONTRACT_SOURCE_EXCLUDES = {
+    "bazel/README.md",
+    "bazel/oci_defs.bzl",
+    "scripts/bazel/driver.py",
+    "scripts/bazel/oci_container.py",
+}
+CONTRACT_MAKE_EXCLUDES = {"BUILD_TIMESTAMP", "SONIC_IMAGE_VERSION", "SOURCE_DATE_EPOCH"}
+CONTRACT_ENVIRONMENT_EXCLUDES = {"SONIC_BAZEL_SOURCE_COMMIT", "SOURCE_DATE_EPOCH"}
 
 
 def require(condition, message):
@@ -40,6 +49,92 @@ def require(condition, message):
 
 def canonical_json(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+
+
+def contract_bytes(contract):
+    """Return the one canonical encoding used to key retained container inputs."""
+    require(isinstance(contract, dict), "container input contract must be a JSON object")
+    return canonical_json(contract) + b"\n"
+
+
+def logical_input_path(name):
+    require(isinstance(name, str) and name and "\x00" not in name and "\\" not in name,
+            "invalid logical container input path")
+    path = PurePosixPath(name)
+    require(not path.is_absolute() and ".." not in path.parts and str(path) == name and name != ".",
+            "logical container input path leaves its root: " + name)
+    return name
+
+
+def container_input_contract(manifest, specs, static_inputs, dynamic_inputs, owned_dependencies):
+    """Normalize exactly the native inputs frozen by a retained OCI baseline."""
+    require(isinstance(manifest, dict) and manifest.get("schema") == SCHEMA,
+            "invalid native source manifest for container inputs")
+    normalized_manifest = json.loads(canonical_json(manifest))
+    normalized_manifest.pop("digest", None)
+    normalized_manifest.pop("environment_digest", None)
+    source = normalized_manifest.get("source")
+    require(isinstance(source, dict) and isinstance(source.get("entries"), dict) and
+            isinstance(source.get("repositories"), list), "invalid native source inventory for container inputs")
+    for name in source["entries"]:
+        logical_input_path(name)
+    source["entries"] = {
+        name: entry for name, entry in source["entries"].items()
+        if name not in CONTRACT_SOURCE_EXCLUDES and not name.startswith("scripts/bazel/tests/")
+    }
+    require(all(isinstance(repository, dict) and isinstance(repository.get("path"), str)
+                for repository in source["repositories"]), "invalid native repository inventory for container inputs")
+    roots = [repository for repository in source["repositories"] if repository["path"] == "."]
+    require(len(roots) == 1 and "commit" in roots[0], "native container inputs require one root repository revision")
+    roots[0].pop("commit")
+    variables = normalized_manifest.get("native_make_variables")
+    require(isinstance(variables, dict), "invalid native make variables for container inputs")
+    for name in CONTRACT_MAKE_EXCLUDES:
+        variables.pop(name, None)
+
+    require(isinstance(specs, dict) and specs, "invalid native container specifications")
+    normalized_specs = json.loads(canonical_json(specs))
+    for name, spec in normalized_specs.items():
+        filename(name, ".gz")
+        require(isinstance(spec, dict) and spec.get("schema") == SCHEMA and spec.get("stage") == "container" and
+                spec.get("target") == "target/" + name and isinstance(spec.get("make_variables"), dict) and
+                isinstance(spec.get("environment"), dict), "invalid native container specification: " + name)
+        for key in CONTRACT_MAKE_EXCLUDES:
+            spec["make_variables"].pop(key, None)
+        for key in CONTRACT_ENVIRONMENT_EXCLUDES:
+            spec["environment"].pop(key, None)
+
+    require(isinstance(static_inputs, dict), "invalid static container input map")
+    normalized_static = {}
+    for name, value in static_inputs.items():
+        logical_input_path(name)
+        require(isinstance(value, str) and SHA256.fullmatch(value) is not None,
+                "invalid static container input SHA-256: " + name)
+        normalized_static[name] = value
+    require(isinstance(dynamic_inputs, list) and all(isinstance(name, str) for name in dynamic_inputs) and
+            len(dynamic_inputs) == len(set(dynamic_inputs)), "invalid dynamic SWSS input paths")
+    normalized_dynamic = sorted(logical_input_path(name) for name in dynamic_inputs)
+    require(not set(normalized_static) & set(normalized_dynamic), "static and dynamic container inputs overlap")
+    require(isinstance(owned_dependencies, dict) and set(owned_dependencies) == set(normalized_specs),
+            "owned container dependency map differs from specifications")
+    owned_paths = {"target/" + name for name in normalized_specs}
+    require(not set(normalized_static) & owned_paths, "static and owned container inputs overlap")
+    normalized_dependencies = {}
+    for name, dependencies in owned_dependencies.items():
+        require(isinstance(dependencies, list) and all(isinstance(value, str) for value in dependencies) and
+                len(dependencies) == len(set(dependencies)), "invalid owned container dependencies: " + name)
+        values = sorted(logical_input_path(value) for value in dependencies)
+        require(set(values) <= owned_paths and "target/" + name not in values,
+                "owned container dependency leaves the selected set: " + name)
+        normalized_dependencies[name] = values
+    return {
+        "schema": SCHEMA,
+        "manifest": normalized_manifest,
+        "specs": normalized_specs,
+        "static_inputs": normalized_static,
+        "dynamic_inputs": normalized_dynamic,
+        "owned_dependencies": normalized_dependencies,
+    }
 
 
 def sha256(data):
@@ -422,75 +517,114 @@ def parse_package(path, expected_sha256=None):
     return package
 
 
-def validate_retained_receipt(state, inv, owned):
-    directory = Path(state) / "oci-retained"
-    require(directory.is_dir() and not directory.is_symlink(), "retained OCI directory is invalid")
+def retained_location(state, inv, owned, contract):
+    require(isinstance(owned, list) and len(owned) == len(set(owned)) and owned, "invalid retained owned-container list")
+    for name in owned:
+        filename(name, ".gz")
+    package_name = filename(inv["swss"], ".deb")
+    require(isinstance(contract, dict) and contract.get("schema") == SCHEMA and
+            set(contract) == {"schema", "manifest", "specs", "static_inputs", "dynamic_inputs", "owned_dependencies"} and
+            isinstance(contract.get("specs"), dict) and set(contract["specs"]) == set(owned) and
+            isinstance(contract.get("owned_dependencies"), dict) and set(contract["owned_dependencies"]) == set(owned),
+            "invalid retained container input contract")
+    data = contract_bytes(contract)
+    require(len(data) <= MAX_JSON, "container input contract is too large")
+    digest = sha256(data)
+    relative = "oci-retained-inputs/" + digest
+    return Path(state), package_name, data, digest, relative
+
+
+def load_retained_inputs(state, inv, owned, contract):
+    """Load only the immutable baseline for this exact container input contract."""
+    state, package_name, contract_data, contract_digest, relative = retained_location(state, inv, owned, contract)
+    base = state / "oci-retained-inputs"
+    require(not base.is_symlink() and (not base.exists() or base.is_dir()), "retained OCI input namespace is invalid")
+    directory = state / relative
     receipt_path = directory / "receipt.json"
+    if not receipt_path.exists() and not receipt_path.is_symlink():
+        require(not directory.exists() and not directory.is_symlink(), "retained OCI directory has no receipt")
+        return None
+    require(directory.is_dir() and not directory.is_symlink() and not stat.S_IMODE(directory.stat().st_mode) & 0o222,
+            "retained OCI directory is invalid")
     receipt_stat = receipt_path.lstat()
     require(stat.S_ISREG(receipt_stat.st_mode) and not stat.S_IMODE(receipt_stat.st_mode) & 0o222,
             "retained OCI receipt must be a read-only regular file")
     receipt = read_json(receipt_path)
-    require(isinstance(receipt, dict) and receipt.get("schema") == SCHEMA and isinstance(receipt.get("identity"), dict) and
+    require(isinstance(receipt, dict) and receipt.get("schema") == RECEIPT_SCHEMA and
+            isinstance(receipt.get("provenance"), dict) and receipt["provenance"] and
+            receipt.get("receipt_path") == relative + "/receipt.json" and
             receipt.get("owned") == sorted(owned) and isinstance(receipt.get("archives"), dict) and
             set(receipt["archives"]) == set(owned), "invalid retained OCI receipt")
     package = receipt.get("package")
-    require(isinstance(package, dict) and package.get("filename") == inv["swss"] and
+    require(isinstance(package, dict) and package.get("filename") == package_name and
             isinstance(package.get("identity"), dict) and package["identity"].get("name") == "swss" and
             package["identity"].get("architecture") == "amd64" and package["identity"].get("version"), "invalid retained package receipt")
-    records = [(inv["swss"], package)] + list(receipt["archives"].items())
+    contract_record = receipt.get("contract")
+    require(isinstance(contract_record, dict) and contract_record.get("sha256") == contract_digest and
+            contract_record.get("size") == len(contract_data), "invalid retained container input receipt")
+    records = [("container-inputs.json", contract_record), (package_name, package)] + list(receipt["archives"].items())
     for name, record in records:
-        require(isinstance(record, dict) and record.get("path") == "oci-retained/" + name and
+        require(isinstance(record, dict) and record.get("path") == relative + "/" + name and
                 isinstance(record.get("sha256"), str) and SHA256.fullmatch(record["sha256"]) is not None and
                 type(record.get("size")) is int and record["size"] >= 0 and isinstance(record.get("file_identity"), dict),
                 "invalid retained file receipt")
-        current = file_identity(Path(state) / record["path"])
+        current = file_identity(state / record["path"])
         require(not current["mode"] & 0o222 and current == record["file_identity"] and current["size"] == record["size"],
                 "retained OCI input file identity changed")
         if name in receipt["archives"]:
             require(record.get("image_name") == name.removesuffix(".gz") and type(record.get("layer_count")) is int and
                     isinstance(record.get("layer_media_types"), list) and record["layer_count"] == len(record["layer_media_types"]) > 0 and
                     set(record["layer_media_types"]) <= LAYER_TYPES, "invalid retained OCI layer receipt")
+    require((state / contract_record["path"]).read_bytes() == contract_data, "retained container input contract changed")
     return receipt
 
 
-def capture_retained_inputs(root: Path, state: Path, inv: dict, owned: list[str], identity: dict) -> dict | None:
-    """Snapshot current native outputs once; callers continue using the normal launcher."""
-    root, state = Path(root), Path(state)
-    require(isinstance(identity, dict), "retained source identity must be a JSON object")
-    canonical_json(identity)
-    require(isinstance(owned, list) and len(owned) == len(set(owned)) and owned, "invalid retained owned-container list")
-    for name in owned:
-        filename(name, ".gz")
-    package_name = filename(inv["swss"], ".deb")
-    directory = state / "oci-retained"
-    if directory.exists() or directory.is_symlink():
-        return validate_retained_receipt(state, inv, owned)
-    sources = {name: root / "target" / name for name in owned}
-    sources[package_name] = root / "target/debs/trixie" / package_name
-    missing = [path for path in sources.values() if not path.exists() and not path.is_symlink()]
-    if missing:
-        return None
+def capture_retained_inputs(state, inv, owned, contract, sources, provenance):
+    """Capture explicit verified Bazel outputs under their native input contract."""
+    state, package_name, contract_data, contract_digest, relative = retained_location(state, inv, owned, contract)
+    require(isinstance(provenance, dict) and provenance, "retained provenance must be a nonempty JSON object")
+    canonical_json(provenance)
+    require(isinstance(sources, dict) and set(sources) == set(owned) | {package_name},
+            "retained sources must name exactly the selected Bazel outputs")
+    sources = {name: Path(path) for name, path in sources.items()}
     require(all(stat.S_ISREG(path.lstat().st_mode) for path in sources.values()), "retained sources must be regular non-symlink files")
-    state.mkdir(parents=True, exist_ok=True)
-    temporary = Path(tempfile.mkdtemp(prefix=".oci-retained-", dir=state))
+    existing = load_retained_inputs(state, inv, owned, contract)
+    if existing is not None:
+        records = {package_name: existing["package"], **existing["archives"]}
+        require(all(hash_file(path) == (records[name]["sha256"], records[name]["size"]) for name, path in sources.items()),
+                "retained container input contract already has a different baseline")
+        return existing
+    base = state / "oci-retained-inputs"
+    base.mkdir(parents=True, exist_ok=True)
+    require(base.is_dir() and not base.is_symlink(), "retained OCI input namespace is invalid")
+    directory = state / relative
+    temporary = Path(tempfile.mkdtemp(prefix="." + contract_digest + "-", dir=base))
     try:
         records = {name: copy_retained(source, temporary / name) for name, source in sorted(sources.items())}
+        with (temporary / "container-inputs.json").open("xb") as stream:
+            stream.write(contract_data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        (temporary / "container-inputs.json").chmod(0o444)
+        contract_record = {"path": relative + "/container-inputs.json", "sha256": contract_digest,
+                           "size": len(contract_data), "file_identity": file_identity(temporary / "container-inputs.json")}
         package = parse_package(temporary / package_name, records[package_name]["sha256"])
-        package_record = {"filename": package_name, "path": "oci-retained/" + package_name,
+        package_record = {"filename": package_name, "path": relative + "/" + package_name,
                           "identity": package["identity"], **records[package_name]}
         archives = {}
         for name in sorted(owned):
             image_name = name.removesuffix(".gz")
             inspected = validate_catalog(archive_catalog(temporary / name, expected_sha256=records[name]["sha256"]), image_name)
-            archives[name] = {"path": "oci-retained/" + name, "image_name": image_name,
+            archives[name] = {"path": relative + "/" + name, "image_name": image_name,
                               "layer_media_types": inspected["layer_media_types"], "layer_count": inspected["layer_count"], **records[name]}
-        receipt = {"schema": SCHEMA, "identity": identity, "owned": sorted(owned), "package": package_record, "archives": archives}
+        receipt = {"schema": RECEIPT_SCHEMA, "receipt_path": relative + "/receipt.json", "provenance": provenance,
+                   "contract": contract_record, "owned": sorted(owned), "package": package_record, "archives": archives}
         write_json(temporary / "receipt.json", receipt)
         (temporary / "receipt.json").chmod(0o444)
         temporary.chmod(0o555)
         require(not directory.exists() and not directory.is_symlink(), "retained OCI directory appeared during capture")
         temporary.rename(directory)
-        return validate_retained_receipt(state, inv, owned)
+        return load_retained_inputs(state, inv, owned, contract)
     finally:
         if temporary.exists():
             temporary.chmod(0o755)
@@ -709,6 +843,18 @@ def overlay(args):
     write_json(args.metadata, result)
 
 
+def validate_contract(args):
+    baseline_data = Path(args.baseline).read_bytes()
+    current_data = Path(args.current).read_bytes()
+    for name, data in (("baseline", baseline_data), ("current", current_data)):
+        require(len(data) <= MAX_JSON, name + " container input contract is too large")
+        require(data == contract_bytes(json.loads(data)), name + " container input contract is not canonical")
+    require(isinstance(args.baseline_sha256, str) and SHA256.fullmatch(args.baseline_sha256) is not None and
+            sha256(baseline_data) == args.baseline_sha256, "baseline container input contract SHA-256 mismatch")
+    require(current_data == baseline_data, "current container inputs differ from retained baseline")
+    write_json(args.stamp, {"schema": SCHEMA, "contract_sha256": args.baseline_sha256})
+
+
 def deterministic_gzip(args):
     source, output = Path(args.input), Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -725,6 +871,10 @@ def deterministic_gzip(args):
 def main():
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
+    command = commands.add_parser("contract")
+    for name in ("baseline", "current", "baseline-sha256", "stamp"):
+        command.add_argument("--" + name, required=True)
+    command.set_defaults(run=validate_contract)
     command = commands.add_parser("extract")
     for name in ("archive", "baseline-deb", "archive-sha256", "baseline-sha256", "image-name", "layout", "metadata"):
         command.add_argument("--" + name, required=True)

@@ -2,6 +2,7 @@
 """Exercise the local SONiC Bazel cache graph without native build actions."""
 
 from collections import Counter
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -143,7 +144,10 @@ class BazelGraphTest(unittest.TestCase):
             "target": target, "jobs": 2, "source_date_epoch": 1,
             "source_commit": "a" * 40, "source_branch": "bazel",
             "_native_environment": {"PATH": "/usr/bin:/bin", "RUSTUP_HOME": str(self.root / "rustup")},
-            "_native_make_variables": {},
+            "_native_make_variables": {
+                "BUILD_TIMESTAMP": "19700101.000001", "SONIC_IMAGE_VERSION": "bazel.fixture",
+                "SOURCE_DATE_EPOCH": "1",
+            },
         }
         containers = {}
         for name, dependencies in (
@@ -154,6 +158,7 @@ class BazelGraphTest(unittest.TestCase):
                 "path": "dockers/" + name.removesuffix(".gz"),
                 "debs_path": "target/debs/trixie", "files_path": "target/files/trixie",
                 "load_dockers": dependencies, "after": [],
+                "depends": [],
             }
         inventory = {
             "image": "sonic-vs.img.gz" if target == "vs-kvm" else "sonic-vs.bin",
@@ -161,23 +166,45 @@ class BazelGraphTest(unittest.TestCase):
             "swss": "swss_1.0.0_amd64.deb", "swss_dbg": "swss-dbg_1.0.0_amd64.deb",
             "containers": containers,
         }
-        manifest = {"environment_digest": "fixture"}
+        artifact_sha256 = hashlib.sha256(b"fixture foundation\n").hexdigest()
+        artifacts = {artifact: {"sha256": artifact_sha256, "size": 19}}
+        manifest = {
+            "schema": 1,
+            "source": {
+                "repositories": [{"path": ".", "commit": "a" * 40, "branch": "bazel", "role": "root"}],
+                "entries": {},
+            },
+            "environment": {}, "environment_digest": "c" * 64,
+            "native_environment": request["_native_environment"],
+            "native_make_variables": request["_native_make_variables"],
+            "dependency_artifacts": {artifact: artifact_sha256},
+            "private_environment_sha256": "d" * 64, "digest": "e" * 64,
+        }
+        contract = driver.container_input_contract(request, inventory, sorted(containers), artifacts, manifest)
         retained = None
         if use_oci:
             write(root / "bazel/oci_defs.bzl", (REPOSITORY / "bazel/oci_defs.bzl").read_text())
             write(root / "scripts/bazel/oci_container.py", (REPOSITORY / "scripts/bazel/oci_container.py").read_text())
-            package_path = "oci-retained/" + inventory["swss"]
+            contract_data = driver.oci_container.contract_bytes(contract)
+            contract_sha256 = hashlib.sha256(contract_data).hexdigest()
+            prefix = "oci-retained-inputs/" + contract_sha256 + "/"
+            contract_path = prefix + "container-inputs.json"
+            write(root / "target/bazel" / contract_path, contract_data.decode())
+            package_path = prefix + inventory["swss"]
             write(root / "target/bazel" / package_path, "retained package fixture\n")
-            retained = {"package": {"path": package_path, "sha256": "a" * 64}, "archives": {}}
+            retained = {
+                "contract": {"path": contract_path, "sha256": contract_sha256},
+                "package": {"path": package_path, "sha256": "a" * 64}, "archives": {},
+            }
             for name in containers:
-                path = "oci-retained/" + name
+                path = prefix + name
                 write(root / "target/bazel" / path, "retained archive fixture\n")
                 retained["archives"][name] = {
                     "path": path, "sha256": "b" * 64, "image_name": name.removesuffix(".gz"),
                     "layer_media_types": ["application/vnd.oci.image.layer.v1.tar"],
                 }
         with mock.patch.multiple(driver, ROOT=root, STATE=root / "target/bazel", WORKSPACE=workspace):
-            driver.generate_workspace(request, inventory, sorted(containers), {artifact: {}}, manifest, retained)
+            driver.generate_workspace(request, inventory, sorted(containers), artifacts, manifest, retained, contract)
         write(workspace / "swss/swss.deb", "fixture SWSS package\n")
         write(workspace / "swss/swss-dbg.deb", "fixture SWSS debug package\n")
         write(workspace / "swss/BUILD.bazel", textwrap.dedent('''\
@@ -220,11 +247,11 @@ class BazelGraphTest(unittest.TestCase):
         graph = json.loads(self.bazel(workspace, "aquery", "deps(//image:sonic_vs)", ["--output=jsonproto"]))
         actions = [action for action in graph.get("actions", []) if action["mnemonic"].startswith("Sonic")]
         self.assertEqual(Counter(action["mnemonic"] for action in actions), Counter({
-            "SonicOciExtract": 2, "SonicSwssOverlay": 1, "SonicOciGzip": 2,
+            "SonicOciContract": 1, "SonicOciExtract": 2, "SonicSwssOverlay": 1, "SonicOciGzip": 2,
             "SonicHost": 1, "SonicImage": 1, "SonicOnie": 1,
         }))
         for action in actions:
-            if action["mnemonic"] in {"SonicOciExtract", "SonicSwssOverlay", "SonicOciGzip"}:
+            if action["mnemonic"] in {"SonicOciContract", "SonicOciExtract", "SonicSwssOverlay", "SonicOciGzip"}:
                 self.assertTrue(action["arguments"][0].endswith("/oci_container.py"))
                 self.assertNotIn("no-sandbox", {item["key"] for item in action.get("executionInfo", [])})
         outputs = self.bazel(workspace, "cquery", "//image:oci_overlay_metadata", ["--output=files"]).splitlines()

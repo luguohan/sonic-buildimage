@@ -90,22 +90,30 @@ reuse the host snapshot. The image action restores that snapshot, loads the
 current containers, and runs the normal filesystem finalization and compression.
 The installer and KVM conversions are separate downstream actions.
 
-After a completed VS build has produced the full container set, the next
-invocation copies the retained archives and runtime SWSS package into
-`target/bazel/native-source/target/bazel/oci-retained`. Bazel validates their
-hashes and OCI descriptors, imports their existing layers, and appends one
-shared layer containing the changed installed SWSS files and package checksums.
-The imports are cached, and the eight image exports can run in parallel. These
-container actions use no Docker daemon or package installer. They produce the
-same `docker-*.gz` paths that the image action already consumes.
+After a successful native container build, the launcher copies the selected
+Bazel output archives and runtime SWSS package into
+`target/bazel/native-source/target/bazel/oci-retained-inputs/<contract-sha256>`.
+The receipt binds those bytes to the native source, dependency hashes, build
+environment, and container action specifications that produced them. A later
+invocation computes the contract from its current inputs. Bazel verifies the
+matching contract, archive hashes, and OCI descriptors, imports the retained
+layers, and appends one shared layer containing the changed installed SWSS
+files and package checksums. The imports are cached, and the eight image exports
+can run in parallel. These container actions use no Docker daemon or package
+installer. They produce the same `docker-*.gz` paths that the image action
+already consumes.
 
 This retained OCI path supports SWSS payload changes that preserve package
 control metadata, conffile contents, and the installed path and ownership
-inventory. It preserves files omitted by the native package policy. The build
-rejects incompatible package changes; changes to container recipes or other
-installed packages require refreshed native container artifacts. If a complete
-retained set is unavailable, the build uses the existing native Docker recipes
-to create it. The launcher and final image composition still use Docker.
+inventory. It preserves files omitted by the native package policy. The
+contract permits the SWSS package bytes and the image tag and creation time to
+change. The current OCI adapter is represented by the generated Bazel graph
+and action tools; its source, documentation, and tests are excluded from the
+retained native source comparison. All other recorded inputs must match.
+Incompatible package changes are rejected. When no matching retained contract
+exists, the launcher reports that it is building a native Docker baseline and
+records a new receipt after that build succeeds. The launcher and final image
+composition still use Docker.
 
 Native host, image, and installer actions run locally in the prepared slave
 because they use its mounted checkout and filesystem mounts. They are serialized
