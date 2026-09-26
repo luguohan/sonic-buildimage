@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Behavioral tests for the owned native source inventory."""
 
+import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -314,6 +316,72 @@ class NativeSourceInventoryTest(unittest.TestCase):
 
         with mock.patch.object(native_action, "git_source_listing", side_effect=repeated_listing):
             self.assert_rejected_before_source_read(root, identity, "repeats a repository")
+
+
+class NativeContainerStaticInputTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="sonic-container-static-test-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.data = b"frozen package bytes\n"
+        self.source = self.root / "frozen"
+        self.source.write_bytes(self.data)
+        self.source.chmod(0o444)
+        self.link = self.root / "bazel-input"
+        self.link.symlink_to(self.source)
+        self.destination = self.root / "target/package.deb"
+        self.destination.parent.mkdir()
+
+    def record(self, mode=0o644):
+        return {"sha256": hashlib.sha256(self.data).hexdigest(), "size": len(self.data), "mode": mode}
+
+    def test_staging_restores_frozen_bytes_and_original_modes(self):
+        for mode in (0o644, 0o755, 0o555):
+            with self.subTest(mode=oct(mode)):
+                if self.destination.exists():
+                    self.destination.chmod(0o600)
+                self.destination.write_bytes(b"mutated native target\n")
+                native_action.stage_container_static_input(self.link, self.destination, self.record(mode))
+                self.assertEqual(self.destination.read_bytes(), self.data)
+                self.assertEqual(stat.S_IMODE(self.destination.stat().st_mode), mode)
+                self.assertFalse(self.source.samefile(self.destination))
+                self.assertEqual(self.source.read_bytes(), self.data)
+                self.assertEqual(stat.S_IMODE(self.source.stat().st_mode), 0o444)
+
+    def test_staging_refuses_writable_alias_and_mismatched_inputs(self):
+        self.destination.write_bytes(b"keep native target\n")
+        for field, value in (("sha256", "0" * 64), ("size", len(self.data) + 1)):
+            expected = self.record()
+            expected[field] = value
+            with self.subTest(field=field), self.assertRaisesRegex(RuntimeError, "SHA-256 or size"):
+                native_action.stage_container_static_input(self.link, self.destination, expected)
+            self.assertEqual(self.destination.read_bytes(), b"keep native target\n")
+        self.source.chmod(0o644)
+        with self.assertRaisesRegex(RuntimeError, "read-only regular"):
+            native_action.stage_container_static_input(self.link, self.destination, self.record())
+        self.source.chmod(0o444)
+        alias = self.root / "hardlink"
+        os.link(self.source, alias)
+        with self.assertRaisesRegex(RuntimeError, "read-only regular"):
+            native_action.stage_container_static_input(self.link, self.destination, self.record())
+        alias.unlink()
+        with self.assertRaisesRegex(RuntimeError, "separate"):
+            native_action.stage_container_static_input(self.link, self.source, self.record())
+
+    def test_container_spec_binds_static_hashes_sizes_and_modes(self):
+        logical = "target/package.deb"
+        manifest = {"dependency_artifacts": {logical: self.record()["sha256"]}}
+        spec = {"stage": "container", "container_static_inputs": {logical: self.record()}}
+        inputs = {logical: self.link}
+        self.assertEqual(native_action.container_static_input_records(manifest, spec, inputs), spec["container_static_inputs"])
+        invalid = json.loads(json.dumps(spec))
+        invalid["container_static_inputs"][logical]["sha256"] = "0" * 64
+        with self.assertRaisesRegex(RuntimeError, "invalid native container"):
+            native_action.container_static_input_records(manifest, invalid, inputs)
+        with self.assertRaisesRegex(RuntimeError, "do not match"):
+            native_action.container_static_input_records(manifest, {"stage": "container"}, inputs)
+        with self.assertRaisesRegex(RuntimeError, "only native container"):
+            native_action.container_static_input_records(manifest, {**spec, "stage": "host"}, inputs)
 
 
 if __name__ == "__main__":

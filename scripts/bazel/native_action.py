@@ -658,6 +658,67 @@ def copy_file(source, destination):
         temporary.unlink(missing_ok=True)
 
 
+def container_static_input_records(manifest, spec, inputs):
+    records = spec.get("container_static_inputs")
+    if spec.get("stage") != "container":
+        if "container_static_inputs" in spec:
+            raise RuntimeError("only native container stages may declare frozen static inputs")
+        return {}
+    dependencies = manifest.get("dependency_artifacts")
+    if (not isinstance(records, dict) or not records or not isinstance(dependencies, dict) or
+            set(records) != set(dependencies) or not set(records) <= set(inputs)):
+        raise RuntimeError("native container frozen static inputs do not match the manifest and action inputs")
+    for logical, record in records.items():
+        if (not isinstance(record, dict) or set(record) != {"sha256", "size", "mode"} or
+                not isinstance(record["sha256"], str) or re.fullmatch(r"[0-9a-f]{64}", record["sha256"]) is None or
+                record["sha256"] != dependencies[logical] or type(record["size"]) is not int or record["size"] < 0 or
+                type(record["mode"]) is not int or not 0 <= record["mode"] <= 0o7777):
+            raise RuntimeError("invalid native container frozen static input: " + logical)
+    return records
+
+
+def _container_static_identity(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def stage_container_static_input(source, destination, expected):
+    """Verify a separate read-only input and stage its bytes with the native mode."""
+    source_path = Path(source)
+    resolved = source_path.resolve(strict=True)
+    before = resolved.lstat()
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) & 0o222:
+        raise RuntimeError("native container frozen static input must be a separate read-only regular file")
+    if destination.exists() and resolved.samefile(destination):
+        raise RuntimeError("native container frozen static input must be separate from its native destination")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as output:
+            temporary = Path(output.name)
+            descriptor = os.open(resolved, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(descriptor, "rb") as input_stream:
+                opened = os.fstat(input_stream.fileno())
+                if _container_static_identity(opened) != _container_static_identity(before):
+                    raise RuntimeError("native container frozen static input changed before staging")
+                digest, size = hashlib.sha256(), 0
+                while chunk := input_stream.read(1024 * 1024):
+                    digest.update(chunk)
+                    size += len(chunk)
+                    output.write(chunk)
+                after = os.fstat(input_stream.fileno())
+        if (_container_static_identity(after) != _container_static_identity(before) or
+                _container_static_identity(resolved.lstat()) != _container_static_identity(before) or
+                source_path.resolve(strict=True) != resolved):
+            raise RuntimeError("native container frozen static input changed while staging")
+        if digest.hexdigest() != expected["sha256"] or size != expected["size"]:
+            raise RuntimeError("native container frozen static input SHA-256 or size differs from its contract")
+        temporary.chmod(expected["mode"])
+        temporary.replace(destination)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def private_environment(path):
     values = load_json(path)
     if not isinstance(values, dict) or any(not isinstance(value, str) for value in values.values()):
@@ -683,6 +744,7 @@ def build(args):
     if spec.get("schema") != SCHEMA or spec.get("stage") not in {"container", "host", "image", "onie", "kvm"}:
         raise RuntimeError("invalid native stage specification")
     inputs = parse_mapping(args.input)
+    static_inputs = container_static_input_records(manifest, spec, inputs)
     outputs = parse_mapping(args.output)
     if set(outputs) != set(spec["outputs"]):
         raise RuntimeError("native stage output declaration does not match its specification")
@@ -696,7 +758,11 @@ def build(args):
         environment = verify_manifest(manifest, root)
         environment["PWD"] = str(root)
         for logical, source in inputs.items():
-            copy_file(source, native_path(root, logical))
+            destination = native_path(root, logical)
+            if logical in static_inputs:
+                stage_container_static_input(source, destination, static_inputs[logical])
+            else:
+                copy_file(source, destination)
         for logical in spec["outputs"].values():
             path = native_path(root, logical)
             path.parent.mkdir(parents=True, exist_ok=True)

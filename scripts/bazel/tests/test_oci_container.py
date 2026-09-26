@@ -246,6 +246,22 @@ class OciContainerTest(unittest.TestCase):
         result = self.command(*arguments, success=success)
         return result, layer, metadata
 
+    def static_fixture(self, suffix=""):
+        native = self.root / ("native" + suffix)
+        state = self.root / ("static-state" + suffix)
+        payloads = {
+            "target/sonic-vs.bin__vs__rfs.squashfs": (b"native rootfs fixture\n", 0o640),
+            "target/files/tool": (b"#!/bin/sh\nexit 0\n", 0o755),
+        }
+        for logical, (data, mode) in payloads.items():
+            source = native / logical
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_bytes(data)
+            source.chmod(mode)
+        artifacts = {logical: {"sha256": digest(data), "size": len(data)}
+                     for logical, (data, _mode) in payloads.items()}
+        return native, state, payloads, artifacts
+
     def test_payload_update_preserves_retained_metadata_and_omitted_files(self):
         baseline = write_deb(self.root / "baseline.deb")
         updated = write_deb(self.root / "updated.deb", binary=b"updated executable with a longer body\n",
@@ -396,6 +412,96 @@ class OciContainerTest(unittest.TestCase):
         result = self.command("contract", "--baseline", baseline, "--current", current,
                               "--baseline-sha256", digest(baseline.read_bytes()), "--stamp", self.root / "encoding.stamp", success=False)
         self.assertIn("not canonical", result.stderr)
+
+    def test_freeze_static_inputs_preserves_bytes_and_original_modes(self):
+        native, state, payloads, artifacts = self.static_fixture()
+
+        receipt = oci_container.freeze_container_static_inputs(state, native, artifacts)
+
+        identity_inputs = {logical: {**artifacts[logical], "mode": mode}
+                           for logical, (_data, mode) in payloads.items()}
+        identity = digest(oci_container.canonical_json(identity_inputs))
+        relative = "container-static-inputs/" + identity
+        self.assertEqual(set(receipt), {"schema", "kind", "identity_sha256", "receipt_path", "inputs", "receipt_sha256"})
+        self.assertEqual((receipt["schema"], receipt["kind"], receipt["identity_sha256"]),
+                         (1, "sonic-container-static-inputs", identity))
+        self.assertEqual(receipt["receipt_path"], relative + "/receipt.json")
+        persisted = {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+        receipt_data = oci_container.canonical_json(persisted) + b"\n"
+        self.assertEqual((state / receipt["receipt_path"]).read_bytes(), receipt_data)
+        self.assertEqual(receipt["receipt_sha256"], digest(receipt_data))
+        self.assertEqual(stat.S_IMODE((state / receipt["receipt_path"]).stat().st_mode), 0o444)
+        for directory in (state / relative, state / relative / "files"):
+            self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o555)
+        for logical, (data, mode) in payloads.items():
+            record = receipt["inputs"][logical]
+            frozen = state / record["path"]
+            self.assertEqual(record, {**artifacts[logical], "mode": mode,
+                                      "path": relative + "/files/" + digest(logical.encode())})
+            self.assertEqual(frozen.read_bytes(), data)
+            self.assertEqual(stat.S_IMODE(frozen.stat().st_mode), 0o444)
+            self.assertNotEqual((frozen.stat().st_dev, frozen.stat().st_ino),
+                                ((native / logical).stat().st_dev, (native / logical).stat().st_ino))
+        self.assertEqual(oci_container.freeze_container_static_inputs(state, native, artifacts), receipt)
+
+        logical = "target/sonic-vs.bin__vs__rfs.squashfs"
+        (native / logical).write_bytes(b"x" * len(payloads[logical][0]))
+        self.assertEqual((state / receipt["inputs"][logical]["path"]).read_bytes(), payloads[logical][0])
+        with self.assertRaisesRegex(RuntimeError, "differs from prepared receipt"):
+            oci_container.freeze_container_static_inputs(state, native, artifacts)
+
+    def test_freeze_static_inputs_refuses_corrupt_existing_snapshots(self):
+        cases = (("receipt", "receipt is malformed or corrupt"), ("bytes", "snapshot bytes are corrupt"),
+                 ("extra", "unexpected entries"), ("mode", "mode changed"))
+        for kind, message in cases:
+            with self.subTest(corruption=kind):
+                native, state, _payloads, artifacts = self.static_fixture("-" + kind)
+                receipt = oci_container.freeze_container_static_inputs(state, native, artifacts)
+                directory = (state / receipt["receipt_path"]).parent
+                inode = directory.stat().st_ino
+                frozen = state / next(iter(receipt["inputs"].values()))["path"]
+                if kind == "receipt":
+                    path = state / receipt["receipt_path"]
+                    path.chmod(0o644)
+                    path.write_bytes(b"{}\n")
+                    path.chmod(0o444)
+                elif kind == "bytes":
+                    frozen.chmod(0o644)
+                    frozen.write_bytes(b"corrupt frozen bytes\n")
+                    frozen.chmod(0o444)
+                elif kind == "extra":
+                    (directory / "files").chmod(0o755)
+                    (directory / "files/unexpected").write_bytes(b"unexpected\n")
+                    (directory / "files").chmod(0o555)
+                else:
+                    frozen.chmod(0o644)
+                with self.assertRaisesRegex(RuntimeError, message):
+                    oci_container.freeze_container_static_inputs(state, native, artifacts)
+                self.assertEqual(directory.stat().st_ino, inode)
+                self.assertEqual({path.name for path in directory.parent.iterdir()}, {".lock", receipt["identity_sha256"]})
+
+    def test_freeze_static_inputs_requires_regular_prepared_sources(self):
+        native, state, payloads, artifacts = self.static_fixture("-mismatch")
+        logical = "target/files/tool"
+        wrong_size = copy.deepcopy(artifacts)
+        wrong_size[logical]["size"] += 1
+        with self.assertRaisesRegex(RuntimeError, "differs from prepared receipt"):
+            oci_container.freeze_container_static_inputs(state, native, wrong_size)
+        self.assertEqual({path.name for path in (state / "container-static-inputs").iterdir()}, {".lock"})
+
+        source = native / logical
+        source.unlink()
+        outside = self.root / "outside-static-input"
+        outside.write_bytes(payloads[logical][0])
+        source.symlink_to(outside)
+        with self.assertRaisesRegex(RuntimeError, "regular non-symlink file"):
+            oci_container.freeze_container_static_inputs(state, native, artifacts)
+
+        source.unlink()
+        source.parent.rmdir()
+        source.parent.symlink_to(self.root, target_is_directory=True)
+        with self.assertRaisesRegex(RuntimeError, "not a regular directory"):
+            oci_container.freeze_container_static_inputs(state, native, artifacts)
 
     def test_capture_uses_explicit_outputs_and_contract_keyed_read_only_receipt(self):
         root = self.root / "bazel-bin"

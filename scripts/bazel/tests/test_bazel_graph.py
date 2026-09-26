@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the local SONiC Bazel cache graph without native build actions."""
 
+import ast
 from collections import Counter
 import hashlib
 import json
@@ -168,6 +169,8 @@ class BazelGraphTest(unittest.TestCase):
         }
         artifact_sha256 = hashlib.sha256(b"fixture foundation\n").hexdigest()
         artifacts = {artifact: {"sha256": artifact_sha256, "size": 19}}
+        container_static = driver.oci_container.freeze_container_static_inputs(root / "target/bazel", root, artifacts)
+        verified_artifacts = container_static["inputs"]
         manifest = {
             "schema": 1,
             "source": {
@@ -180,7 +183,7 @@ class BazelGraphTest(unittest.TestCase):
             "dependency_artifacts": {artifact: artifact_sha256},
             "private_environment_sha256": "d" * 64, "digest": "e" * 64,
         }
-        contract = driver.container_input_contract(request, inventory, sorted(containers), artifacts, manifest)
+        contract = driver.container_input_contract(request, inventory, sorted(containers), verified_artifacts, manifest)
         retained = None
         if use_oci:
             write(root / "bazel/oci_defs.bzl", (REPOSITORY / "bazel/oci_defs.bzl").read_text())
@@ -204,7 +207,7 @@ class BazelGraphTest(unittest.TestCase):
                     "layer_media_types": ["application/vnd.oci.image.layer.v1.tar"],
                 }
         with mock.patch.multiple(driver, ROOT=root, STATE=root / "target/bazel", WORKSPACE=workspace):
-            driver.generate_workspace(request, inventory, sorted(containers), artifacts, manifest, retained, contract)
+            driver.generate_workspace(request, inventory, sorted(containers), artifacts, manifest, retained, contract, container_static)
         write(workspace / "swss/swss.deb", "fixture SWSS package\n")
         write(workspace / "swss/swss-dbg.deb", "fixture SWSS debug package\n")
         write(workspace / "swss/BUILD.bazel", textwrap.dedent('''\
@@ -212,6 +215,35 @@ class BazelGraphTest(unittest.TestCase):
             filegroup(name = "swss_dbg_deb", srcs = ["swss-dbg.deb"], visibility = ["//visibility:public"])
         '''))
         return workspace
+
+    def test_generated_native_containers_use_frozen_static_inputs(self):
+        workspace = self.generated_fixture("vs")
+        root = workspace.parents[2]
+        logical = "target/debs/trixie/foundation.deb"
+        expected = {"sha256": hashlib.sha256(b"fixture foundation\n").hexdigest(), "size": 19, "mode": 0o644}
+        tree = ast.parse((workspace / "image/BUILD.bazel").read_text())
+        stages = []
+        for node in tree.body:
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name) and node.value.func.id == "sonic_native_stage":
+                stages.append({keyword.arg: ast.literal_eval(keyword.value) for keyword in node.value.keywords})
+        frozen, live = [], []
+        for stage in stages:
+            label = next(label for label, path in stage["inputs"].items() if path == logical)
+            source = workspace / "inputs" / label.removeprefix("//inputs:")
+            spec = json.loads((workspace / "image" / stage["spec"].removeprefix(":")).read_text())
+            if stage["mnemonic"] == "SonicContainer":
+                source.resolve().relative_to(root / "target/bazel/container-static-inputs")
+                self.assertEqual(spec["container_static_inputs"], {logical: expected})
+                frozen.append(source)
+            else:
+                self.assertEqual(source.resolve(), root / logical)
+                self.assertNotIn("container_static_inputs", spec)
+                live.append(source)
+        self.assertEqual(len(frozen), 2)
+        self.assertEqual(len(live), 3)
+        (root / logical).write_text("mutated target\n")
+        self.assertTrue(all(path.read_bytes() == b"fixture foundation\n" for path in frozen))
+        self.assertTrue(all(path.read_bytes() == b"mutated target\n" for path in live))
 
     def test_generated_vs_targets_analyze_with_expected_outputs(self):
         cases = (

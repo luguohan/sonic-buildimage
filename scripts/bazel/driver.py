@@ -379,7 +379,8 @@ def starlark(value):
     return json.dumps(value, indent=4, sort_keys=True)
 
 
-def native_stage_spec(request, inv, stage, target, outputs, host_snapshot=None, assume_old=(), context_mounts=None):
+def native_stage_spec(request, inv, stage, target, outputs, host_snapshot=None, assume_old=(),
+                      context_mounts=None, container_static_inputs=None):
     spec = {
         "schema": 1, "stage": stage, "target": target, "outputs": outputs,
         "environment": {
@@ -393,10 +394,30 @@ def native_stage_spec(request, inv, stage, target, outputs, host_snapshot=None, 
     }
     if host_snapshot:
         spec["host_snapshot"] = host_snapshot
+    if container_static_inputs is not None:
+        if stage != "container":
+            raise RuntimeError("frozen static inputs apply only to native container stages")
+        spec["container_static_inputs"] = container_static_inputs
     return spec
 
 
-def container_stage_specs(request, inv, owned):
+def container_static_records(static_inputs):
+    if not isinstance(static_inputs, dict) or not static_inputs:
+        raise RuntimeError("native container stages require frozen static inputs")
+    records = {}
+    for logical, item in static_inputs.items():
+        if (not isinstance(logical, str) or not isinstance(item, dict) or not {"sha256", "size", "mode"} <= set(item) or
+                not isinstance(item["sha256"], str) or oci_container.SHA256.fullmatch(item["sha256"]) is None or
+                type(item["size"]) is not int or item["size"] < 0 or type(item["mode"]) is not int or
+                not 0 <= item["mode"] <= 0o7777):
+            raise RuntimeError("invalid frozen static container input: " + str(logical))
+        oci_container.logical_input_path(logical)
+        records[logical] = {key: item[key] for key in ("sha256", "size", "mode")}
+    return records
+
+
+def container_stage_specs(request, inv, owned, static_inputs):
+    static_records = container_static_records(static_inputs)
     result = {}
     for name in owned:
         item = inv["containers"][name]
@@ -408,12 +429,15 @@ def container_stage_specs(request, inv, owned):
         result[name] = native_stage_spec(
             request, inv, "container", "target/" + name,
             {"containers/" + name: "target/" + name}, context_mounts=mounts,
+            container_static_inputs=static_records,
         )
     return result
 
 
 def container_input_contract(request, inv, owned, artifacts, manifest):
     static_inputs = {path: item["sha256"] for path, item in artifacts.items()}
+    if manifest.get("dependency_artifacts") != static_inputs:
+        raise RuntimeError("container contract static hashes differ from the prepared manifest")
     dynamic_inputs = sorted("target/debs/trixie/" + name for name in (inv["swss"], inv["swss_dbg"]))
     dependencies = {
         name: sorted({"target/" + dependency for dependency in
@@ -422,7 +446,7 @@ def container_input_contract(request, inv, owned, artifacts, manifest):
         for name in owned
     }
     return oci_container.container_input_contract(
-        manifest, container_stage_specs(request, inv, owned), static_inputs, dynamic_inputs, dependencies,
+        manifest, container_stage_specs(request, inv, owned, artifacts), static_inputs, dynamic_inputs, dependencies,
     )
 
 
@@ -485,7 +509,7 @@ def oci_container_rules(inv, owned, retained, baseline_label, archive_labels, co
     return lines
 
 
-def generate_workspace(request, inv, owned, artifacts, manifest, retained=None, contract=None):
+def generate_workspace(request, inv, owned, artifacts, manifest, retained=None, contract=None, container_static=None):
     WORKSPACE.mkdir(parents=True, exist_ok=True)
     write_text(WORKSPACE / ".bazelversion", (ROOT / ".bazelversion").read_text())
     module = 'module(name = "sonic_vs_local")\n\nbazel_dep(name = "rules_cc", version = "0.1.1")\n'
@@ -535,6 +559,19 @@ def generate_workspace(request, inv, owned, artifacts, manifest, retained=None, 
 
     for logical in sorted(artifacts):
         labels[expose_input(logical)] = logical
+    frozen_labels = {}
+    static_inputs = None
+    if owned:
+        static_inputs = container_static.get("inputs") if isinstance(container_static, dict) else None
+        if (not isinstance(static_inputs, dict) or set(static_inputs) != set(artifacts) or
+                any(not isinstance(item, dict) or item.get("sha256") != artifacts[logical]["sha256"] or
+                    item.get("size") != artifacts[logical]["size"] for logical, item in static_inputs.items())):
+            raise RuntimeError("frozen static container inputs differ from the prepared receipt")
+        container_static_records(static_inputs)
+        if not retained:
+            for logical, item in sorted(static_inputs.items()):
+                frozen_path = str((STATE / item["path"]).relative_to(ROOT))
+                frozen_labels[expose_input(frozen_path)] = logical
     baseline_label = None
     contract_label = None
     archive_labels = {}
@@ -565,8 +602,9 @@ def generate_workspace(request, inv, owned, artifacts, manifest, retained=None, 
         ] + lines
         created = datetime.datetime.fromtimestamp(request["source_date_epoch"], datetime.timezone.utc)
         write_text(WORKSPACE / "image/image-created.txt", created.strftime("%Y-%m-%dT%H:%M:%SZ") + "\n")
-    def add_stage(name, stage, target, inputs, outputs, mnemonic, host_snapshot=None, assume_old=(), context_mounts=None):
-        spec = native_stage_spec(request, inv, stage, target, outputs, host_snapshot, assume_old, context_mounts)
+    def add_stage(name, stage, target, inputs, outputs, mnemonic, host_snapshot=None, assume_old=(),
+                  context_mounts=None, container_static_inputs=None):
+        spec = native_stage_spec(request, inv, stage, target, outputs, host_snapshot, assume_old, context_mounts, container_static_inputs)
         spec_name = name + ".json"
         write_json(WORKSPACE / "image" / spec_name, spec)
         lines.append("sonic_native_stage(\n    name = " + starlark(name) + ",\n    spec = " + starlark(":" + spec_name) +
@@ -581,17 +619,18 @@ def generate_workspace(request, inv, owned, artifacts, manifest, retained=None, 
     if retained:
         lines.extend(oci_container_rules(inv, owned, retained, baseline_label, archive_labels, contract_label))
     else:
-        specs = container_stage_specs(request, inv, owned)
+        specs = container_stage_specs(request, inv, owned, static_inputs) if owned else {}
         for name in owned:
             rule_name = "container_" + name.replace("-", "_").replace(".", "_")
             output_path = "containers/" + name
-            inputs = dict(labels)
+            inputs = dict(frozen_labels)
             inputs.update(package_inputs)
             item = inv["containers"][name]
             for dependency in item["load_dockers"] + item["after"]:
                 if dependency in owned:
                     inputs[":containers/" + dependency] = "target/" + dependency
-            add_stage(rule_name, "container", "target/" + name, inputs, {output_path: "target/" + name}, "SonicContainer", context_mounts=specs[name]["context_mounts"])
+            add_stage(rule_name, "container", "target/" + name, inputs, {output_path: "target/" + name}, "SonicContainer",
+                      context_mounts=specs[name]["context_mounts"], container_static_inputs=specs[name]["container_static_inputs"])
     if container_labels:
         lines.append('filegroup(name = "owned_container_archives", srcs = ' + starlark(list(container_labels.values())) + ')')
     if "docker-orchagent.gz" in container_labels:
@@ -628,7 +667,7 @@ def generate_workspace(request, inv, owned, artifacts, manifest, retained=None, 
     write_text(WORKSPACE / "image/BUILD.bazel", "\n\n".join(lines) + "\n")
 
 
-def build(request, inv, manifest, retained=None, contract=None):
+def build(request, inv, manifest, retained=None, contract=None, container_static=None):
     target = {
         "swss": "//swss:swss_deb", "container": "//image:swss_container",
         "vs": "//image:sonic_vs", "vs-kvm": "//image:sonic_vs_kvm",
@@ -647,6 +686,8 @@ def build(request, inv, manifest, retained=None, contract=None):
     owned = selected_owned(request, inv)
     if owned and contract is None:
         raise RuntimeError("container builds require the current input contract")
+    if owned and not isinstance(container_static, dict):
+        raise RuntimeError("container builds require verified frozen static inputs")
     # cquery reports paths without materializing cached outputs. Request every
     # collected artifact as a top-level build output before querying its path.
     metadata_label = "//image:oci_overlay_metadata"
@@ -696,6 +737,13 @@ def build(request, inv, manifest, retained=None, contract=None):
         "profile": str(log_dir / "profile.json.gz"), "execution_log": str(log_dir / "execution.json"),
     }
     report["container_backend"] = "oci" if retained else ("native-docker" if request["target"] != "swss" else "none")
+    if owned:
+        report["container_static_inputs"] = {
+            "receipt": str(STATE / container_static["receipt_path"]),
+            "receipt_sha256": container_static["receipt_sha256"],
+            "identity_sha256": container_static["identity_sha256"],
+            "input_count": len(container_static["inputs"]),
+        }
     if contract is not None:
         destination = artifact_dir / "container-inputs.json"
         native_action.copy_file(WORKSPACE / "image/container-inputs.json", destination)
@@ -720,6 +768,7 @@ def build(request, inv, manifest, retained=None, contract=None):
                 "buildimage_commit": request["source_commit"], "swss_commit": request["swss_commit"],
                 "swss_source_digest": request["swss_digest"], "image_version": inv["image_version"],
                 "source_manifest_sha256": report["source_manifest_sha256"],
+                "container_static_inputs": report["container_static_inputs"],
                 "profile": report["profile"], "execution_log": report["execution_log"],
             },
         )
@@ -755,13 +804,15 @@ def main():
     artifacts = prepared_artifacts(request, inv, owned)
     prepare_action_environment(request, inv, owned, artifacts)
     prepare_swss(request, inv)
-    manifest = prepare_environment(request, inv, artifacts)
-    contract = container_input_contract(request, inv, owned, artifacts, manifest) if owned else None
+    container_static = oci_container.freeze_container_static_inputs(STATE, ROOT, artifacts) if owned else None
+    verified_artifacts = container_static["inputs"] if container_static else artifacts
+    manifest = prepare_environment(request, inv, verified_artifacts)
+    contract = container_input_contract(request, inv, owned, verified_artifacts, manifest) if owned else None
     retained = oci_container.load_retained_inputs(STATE, inv, owned, contract) if owned else None
     if owned:
         print("Container construction: " + ("verified retained OCI layers" if retained else "native Docker baseline for the current inputs"), flush=True)
-    generate_workspace(request, inv, owned, artifacts, manifest, retained, contract)
-    build(request, inv, manifest, retained, contract)
+    generate_workspace(request, inv, owned, artifacts, manifest, retained, contract, container_static)
+    build(request, inv, manifest, retained, contract, container_static)
 
 
 if __name__ == "__main__":

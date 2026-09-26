@@ -90,6 +90,14 @@ reuse the host snapshot. The image action restores that snapshot, loads the
 current containers, and runs the normal filesystem finalization and compression.
 The installer and KVM conversions are separate downstream actions.
 
+After action-environment preparation, the launcher rechecks the prepared static
+artifacts and stores read-only copies under
+`target/bazel/native-source/target/bazel/container-static-inputs/<identity-sha256>`.
+Native container actions verify these copies against the manifest hashes and
+sizes, then stage them with their original target modes. Host, image, and
+installer actions continue to use their existing live static inputs. Each
+container run records the static snapshot receipt and its hash.
+
 After a successful native container build, the launcher copies the selected
 Bazel output archives and runtime SWSS package into
 `target/bazel/native-source/target/bazel/oci-retained-inputs/<contract-sha256>`.
@@ -161,9 +169,10 @@ target/bazel/native-source/target/bazel/artifacts/<target>/
 ```
 
 `build-manifest.json` records source identities, output sizes and hashes, the
-environment identity, the selected container backend, and the profile and
-execution-log paths. OCI runs also record the retained-input receipt and copy
-the SWSS overlay report beside the manifest. Intermediate container and
+environment identity, the selected container backend, the static container
+snapshot receipt, and the profile and execution-log paths. OCI runs also record
+the retained-input receipt and copy the SWSS overlay report beside the manifest.
+Intermediate container and
 filesystem outputs remain under the generated Bazel workspace's output tree.
 The build does not push branches or create pull requests.
 

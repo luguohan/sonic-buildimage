@@ -2,6 +2,8 @@
 """Reuse retained SONiC OCI layers for compatible SWSS package updates."""
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import gzip
 import hashlib
 import io
@@ -215,6 +217,252 @@ def copy_retained(source, destination):
     Path(destination).chmod(0o444)
     return {"sha256": digest.hexdigest(), "size": before.st_size,
             "file_identity": file_identity(destination)}
+
+
+def _static_stat(value):
+    return (value.st_dev, value.st_ino, value.st_mode, value.st_nlink, value.st_size,
+            value.st_mtime_ns, value.st_ctime_ns)
+
+
+def _static_directory_identity(value):
+    require(stat.S_ISDIR(value.st_mode), "container static input directory is not a regular directory")
+    return value.st_dev, value.st_ino, value.st_mode
+
+
+@contextmanager
+def _static_parent(root, logical):
+    """Open non-symlink parents and keep their pathname identities stable."""
+    logical_input_path(logical)
+    parts = PurePosixPath(logical).parts
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    opened = []
+    try:
+        before = Path(root).lstat()
+        expected = _static_directory_identity(before)
+        descriptor = os.open(root, flags)
+        opened.append((None, Path(root), descriptor, expected))
+        require(_static_directory_identity(os.fstat(descriptor)) == expected,
+                "container static input root changed while opening")
+        for part in parts[:-1]:
+            before = os.stat(part, dir_fd=descriptor, follow_symlinks=False)
+            expected = _static_directory_identity(before)
+            child = os.open(part, flags, dir_fd=descriptor)
+            opened.append((descriptor, part, child, expected))
+            require(_static_directory_identity(os.fstat(child)) == expected,
+                    "container static input directory changed while opening")
+            descriptor = child
+        yield descriptor, parts[-1]
+        for parent, name, descriptor, expected in reversed(opened):
+            current = Path(name).lstat() if parent is None else os.stat(name, dir_fd=parent, follow_symlinks=False)
+            require(_static_directory_identity(current) == _static_directory_identity(os.fstat(descriptor)) == expected,
+                    "container static input directory identity changed")
+    except OSError as error:
+        raise RuntimeError("container static input path cannot be accessed safely: " + str(Path(root) / logical)) from error
+    finally:
+        for _parent, _name, descriptor, _expected in reversed(opened):
+            os.close(descriptor)
+
+
+def _static_file(root, logical, destination=None, expected_mode=None, single_link=False, capture=False):
+    """Read or copy one stable regular file without following pathname symlinks."""
+    with _static_parent(root, logical) as (parent, name):
+        before = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        require(stat.S_ISREG(before.st_mode), "container static input must be a regular non-symlink file: " + logical)
+        mode = stat.S_IMODE(before.st_mode)
+        require(expected_mode is None or mode == expected_mode, "container static input mode changed: " + logical)
+        require(not single_link or before.st_nlink == 1, "container static input has multiple hardlinks: " + logical)
+        descriptor = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        digest = hashlib.sha256()
+        data = bytearray() if capture else None
+        count = 0
+        with os.fdopen(descriptor, "rb") as source:
+            require(_static_stat(os.fstat(source.fileno())) == _static_stat(before),
+                    "container static input changed while opening: " + logical)
+            output = Path(destination).open("xb") if destination is not None else None
+            try:
+                for chunk in iter(lambda: source.read(CHUNK), b""):
+                    count += len(chunk)
+                    digest.update(chunk)
+                    if data is not None:
+                        require(count <= MAX_JSON, "container static input receipt is too large")
+                        data.extend(chunk)
+                    if output is not None:
+                        output.write(chunk)
+                if output is not None:
+                    output.flush()
+                    os.fchmod(output.fileno(), 0o444)
+                    os.fsync(output.fileno())
+                    copied = os.fstat(output.fileno())
+                    require(stat.S_ISREG(copied.st_mode) and copied.st_nlink == 1 and
+                            (copied.st_dev, copied.st_ino) != (before.st_dev, before.st_ino),
+                            "container static input copy is not a separate regular file")
+            finally:
+                if output is not None:
+                    output.close()
+            after = os.fstat(source.fileno())
+        current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        require(count == before.st_size and _static_stat(before) == _static_stat(after) == _static_stat(current),
+                "container static input changed while reading: " + logical)
+    return ({"sha256": digest.hexdigest(), "size": count, "mode": mode},
+            bytes(data) if data is not None else None, (before.st_dev, before.st_ino))
+
+
+def _static_directory_snapshot(state, relative, read_only=False):
+    with _static_parent(state, relative + "/.inventory") as (descriptor, _name):
+        before = os.fstat(descriptor)
+        require(not read_only or stat.S_IMODE(before.st_mode) == 0o555,
+                "container static input snapshot directory is not read-only")
+        entries = sorted(os.listdir(descriptor))
+        require(_static_stat(os.fstat(descriptor)) == _static_stat(before),
+                "container static input directory changed while listing")
+    return _static_stat(before), entries
+
+
+@contextmanager
+def _static_publication_lock(state):
+    with _static_parent(state, "container-static-inputs/.lock") as (parent, name):
+        descriptor = os.open(name, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                             0o600, dir_fd=parent)
+        try:
+            before = os.fstat(descriptor)
+            require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and before.st_size == 0 and
+                    stat.S_IMODE(before.st_mode) == 0o600 and
+                    _static_stat(before) == _static_stat(os.stat(name, dir_fd=parent, follow_symlinks=False)),
+                    "container static input publication lock is invalid")
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            require(_static_stat(before) == _static_stat(os.fstat(descriptor)) ==
+                    _static_stat(os.stat(name, dir_fd=parent, follow_symlinks=False)),
+                    "container static input publication lock changed while waiting")
+            yield
+            require(_static_stat(before) == _static_stat(os.fstat(descriptor)) ==
+                    _static_stat(os.stat(name, dir_fd=parent, follow_symlinks=False)),
+                    "container static input publication lock changed")
+        finally:
+            os.close(descriptor)
+
+
+def _load_container_static_inputs(state, relative, receipt, source_identities):
+    directory = state / relative
+    try:
+        current = directory.lstat()
+    except FileNotFoundError as error:
+        raise RuntimeError("container static input snapshot disappeared") from error
+    require(stat.S_ISDIR(current.st_mode), "container static input snapshot path is not a regular directory")
+    directory_before = _static_directory_snapshot(state, relative, read_only=True)
+    require(directory_before[0] == _static_stat(current), "container static input snapshot changed while opening")
+    require(directory_before[1] == ["files", "receipt.json"], "container static input snapshot has unexpected entries")
+    files_before = _static_directory_snapshot(state, relative + "/files", read_only=True)
+    expected_files = sorted(PurePosixPath(record["path"]).name for record in receipt["inputs"].values())
+    require(files_before[1] == expected_files, "container static input files have unexpected entries")
+    receipt_data = canonical_json(receipt) + b"\n"
+    _record, actual_data, _identity = _static_file(
+        state, receipt["receipt_path"], expected_mode=0o444, single_link=True, capture=True)
+    require(actual_data == receipt_data, "container static input receipt is malformed or corrupt")
+    for logical, expected in sorted(receipt["inputs"].items()):
+        actual, _data, identity = _static_file(state, expected["path"], expected_mode=0o444, single_link=True)
+        require(actual["sha256"] == expected["sha256"] and actual["size"] == expected["size"],
+                "container static input snapshot bytes are corrupt: " + logical)
+        require(identity != source_identities[logical], "container static input snapshot aliases its current source: " + logical)
+    require(_static_directory_snapshot(state, relative, read_only=True) == directory_before and
+            _static_directory_snapshot(state, relative + "/files", read_only=True) == files_before,
+            "container static input snapshot directory identity changed")
+    return {**receipt, "receipt_sha256": sha256(receipt_data)}
+
+
+def freeze_container_static_inputs(state, root, artifacts):
+    """Freeze prepared target files into one exact, immutable container input set.
+
+    The returned receipt adds receipt_sha256 to the persisted canonical fields.
+    Input modes describe the sources; input paths address read-only copies under state.
+    """
+    state, root = Path(os.path.abspath(state)), Path(os.path.abspath(root))
+    require(isinstance(artifacts, dict) and all(isinstance(name, str) for name in artifacts),
+            "invalid prepared container static input map")
+    prepared = {}
+    for logical, record in sorted(artifacts.items()):
+        logical_input_path(logical)
+        require(logical.startswith("target/"), "container static input is outside target: " + logical)
+        require(isinstance(record, dict) and set(record) == {"sha256", "size"} and
+                isinstance(record["sha256"], str) and SHA256.fullmatch(record["sha256"]) is not None and
+                type(record["size"]) is int and record["size"] >= 0,
+                "invalid prepared container static input receipt: " + logical)
+        require(not (root / logical).is_relative_to(state / "container-static-inputs"),
+                "container static input is inside its snapshot namespace: " + logical)
+        prepared[logical] = {"sha256": record["sha256"], "size": record["size"]}
+    require(not any(str(parent) in prepared for logical in prepared for parent in PurePosixPath(logical).parents),
+            "container static input file and directory paths overlap")
+    _static_directory_identity(root.lstat())
+    state.mkdir(parents=True, exist_ok=True)
+    _static_directory_identity(state.lstat())
+    base = state / "container-static-inputs"
+    base.mkdir(exist_ok=True)
+    _static_directory_identity(base.lstat())
+    with _static_publication_lock(state):
+        _identity, namespace_entries = _static_directory_snapshot(state, "container-static-inputs")
+        require(all(name == ".lock" or SHA256.fullmatch(name) is not None for name in namespace_entries),
+                "container static input namespace has unexpected entries")
+        for name in namespace_entries:
+            if name != ".lock":
+                require(stat.S_ISDIR((base / name).lstat().st_mode),
+                        "container static input namespace contains an invalid snapshot")
+        identity_inputs = {}
+        for logical, expected in prepared.items():
+            with _static_parent(root, logical) as (parent, name):
+                current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                require(stat.S_ISREG(current.st_mode),
+                        "container static input must be a regular non-symlink file: " + logical)
+                identity_inputs[logical] = {**expected, "mode": stat.S_IMODE(current.st_mode)}
+        identity_sha256 = sha256(canonical_json(identity_inputs))
+        relative = "container-static-inputs/" + identity_sha256
+        inputs = {logical: {**record, "path": relative + "/files/" + sha256(logical.encode())}
+                  for logical, record in identity_inputs.items()}
+        require(len({record["path"] for record in inputs.values()}) == len(inputs),
+                "container static input storage paths collide")
+        receipt = {"schema": SCHEMA, "kind": "sonic-container-static-inputs", "identity_sha256": identity_sha256,
+                   "receipt_path": relative + "/receipt.json", "inputs": inputs}
+        require(len(canonical_json(receipt) + b"\n") <= MAX_JSON, "container static input receipt is too large")
+        directory = state / relative
+        existing = directory.exists() or directory.is_symlink()
+        temporary = None if existing else Path(tempfile.mkdtemp(prefix=".pending-", dir=base))
+        temporary_identity = None if temporary is None else _static_directory_identity(temporary.lstat())[:2]
+        try:
+            if temporary is not None:
+                (temporary / "files").mkdir()
+            source_identities = {}
+            for logical, expected in inputs.items():
+                destination = temporary / "files" / PurePosixPath(expected["path"]).name if temporary is not None else None
+                actual, _data, source_identities[logical] = _static_file(
+                    root, logical, destination=destination, expected_mode=expected["mode"])
+                require(actual == {key: expected[key] for key in ("sha256", "size", "mode")},
+                        "container static input differs from prepared receipt: " + logical)
+            if existing:
+                return _load_container_static_inputs(state, relative, receipt, source_identities)
+            receipt_data = canonical_json(receipt) + b"\n"
+            with (temporary / "receipt.json").open("xb") as stream:
+                stream.write(receipt_data)
+                stream.flush()
+                os.fchmod(stream.fileno(), 0o444)
+                os.fsync(stream.fileno())
+            (temporary / "files").chmod(0o555)
+            temporary.chmod(0o555)
+            require(not directory.exists() and not directory.is_symlink(),
+                    "container static input snapshot appeared during capture")
+            temporary.rename(directory)
+            return _load_container_static_inputs(state, relative, receipt, source_identities)
+        finally:
+            if temporary is not None:
+                try:
+                    current = temporary.lstat()
+                except FileNotFoundError:
+                    pass
+                else:
+                    require(_static_directory_identity(current)[:2] == temporary_identity,
+                            "container static input temporary directory identity changed")
+                    temporary.chmod(0o755)
+                    files = temporary / "files"
+                    if files.is_dir() and not files.is_symlink():
+                        files.chmod(0o755)
+                    shutil.rmtree(temporary)
 
 
 class DigestReader:
