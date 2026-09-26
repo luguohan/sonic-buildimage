@@ -1,9 +1,10 @@
 # Incremental SONiC VS build with Bazel
 
 This opt-in build uses Bazel for SWSS compilation and for the artifact chain
-from the SWSS Debian packages through the containers and VS image. It keeps the
-existing SONiC Docker and installer recipes as local Bazel actions, so the image
-uses the same public build logic as the native build.
+from the SWSS Debian packages through the containers and VS image. With retained
+container artifacts, Bazel assembles SWSS payload updates as OCI layers using
+`rules_img`, then exports the archive format consumed by the existing SONiC
+image and installer recipes.
 
 ## Build
 
@@ -89,10 +90,27 @@ reuse the host snapshot. The image action restores that snapshot, loads the
 current containers, and runs the normal filesystem finalization and compression.
 The installer and KVM conversions are separate downstream actions.
 
-Native container and image actions run locally in the prepared slave because
-they use its mounted checkout, Docker daemon, and filesystem mounts. They are
-serialized around those shared native paths. Bazel can reuse their cached file
-outputs. SWSS C++ actions can run in parallel.
+After a completed VS build has produced the full container set, the next
+invocation copies the retained archives and runtime SWSS package into
+`target/bazel/native-source/target/bazel/oci-retained`. Bazel validates their
+hashes and OCI descriptors, imports their existing layers, and appends one
+shared layer containing the changed installed SWSS files and package checksums.
+The imports are cached, and the eight image exports can run in parallel. These
+container actions use no Docker daemon or package installer. They produce the
+same `docker-*.gz` paths that the image action already consumes.
+
+This retained OCI path supports SWSS payload changes that preserve package
+control metadata, conffile contents, and the installed path and ownership
+inventory. It preserves files omitted by the native package policy. The build
+rejects incompatible package changes; changes to container recipes or other
+installed packages require refreshed native container artifacts. If a complete
+retained set is unavailable, the build uses the existing native Docker recipes
+to create it. The launcher and final image composition still use Docker.
+
+Native host, image, and installer actions run locally in the prepared slave
+because they use its mounted checkout and filesystem mounts. They are serialized
+around those shared native paths. Bazel can reuse their cached file outputs.
+SWSS C++ and OCI container actions can run in parallel.
 
 ## Preparation and cache inputs
 
@@ -135,9 +153,11 @@ target/bazel/native-source/target/bazel/artifacts/<target>/
 ```
 
 `build-manifest.json` records source identities, output sizes and hashes, the
-environment identity, and the profile and execution-log paths. Intermediate
-container and filesystem outputs remain under the generated Bazel workspace's
-output tree. The build does not push branches or create pull requests.
+environment identity, the selected container backend, and the profile and
+execution-log paths. OCI runs also record the retained-input receipt and copy
+the SWSS overlay report beside the manifest. Intermediate container and
+filesystem outputs remain under the generated Bazel workspace's output tree.
+The build does not push branches or create pull requests.
 
 ## Validation
 
@@ -156,5 +176,5 @@ packages, containers, and images and inspect the installed SWSS version.
 For an incremental run, build the same target twice, edit one SWSS C++ source,
 and build again. Compare the Bazel execution logs. The unchanged run should
 reuse the Bazel outputs; the edit should recompile its affected C++ targets,
-repackage SWSS, rebuild the SWSS container chain, and rebuild image composition
+repackage SWSS, assemble the updated containers, and rebuild image composition
 while reusing the host filesystem action.

@@ -131,8 +131,8 @@ class BazelGraphTest(unittest.TestCase):
         self.bazel(workspace, "build", "//:image", options)
         self.assertEqual(Counter(log.read_text().splitlines()), Counter(("container", "image")))
 
-    def generated_fixture(self, target):
-        root = self.root / ("generated-" + target)
+    def generated_fixture(self, target, use_oci=False):
+        root = self.root / ("generated-" + target + ("-oci" if use_oci else ""))
         workspace = root / "target/bazel/workspace"
         write(root / ".bazelversion", (REPOSITORY / ".bazelversion").read_text())
         write(root / "bazel/defs.bzl", (REPOSITORY / "bazel/defs.bzl").read_text())
@@ -157,12 +157,27 @@ class BazelGraphTest(unittest.TestCase):
             }
         inventory = {
             "image": "sonic-vs.img.gz" if target == "vs-kvm" else "sonic-vs.bin",
+            "image_version": "bazel.fixture",
             "swss": "swss_1.0.0_amd64.deb", "swss_dbg": "swss-dbg_1.0.0_amd64.deb",
             "containers": containers,
         }
         manifest = {"environment_digest": "fixture"}
+        retained = None
+        if use_oci:
+            write(root / "bazel/oci_defs.bzl", (REPOSITORY / "bazel/oci_defs.bzl").read_text())
+            write(root / "scripts/bazel/oci_container.py", (REPOSITORY / "scripts/bazel/oci_container.py").read_text())
+            package_path = "oci-retained/" + inventory["swss"]
+            write(root / "target/bazel" / package_path, "retained package fixture\n")
+            retained = {"package": {"path": package_path, "sha256": "a" * 64}, "archives": {}}
+            for name in containers:
+                path = "oci-retained/" + name
+                write(root / "target/bazel" / path, "retained archive fixture\n")
+                retained["archives"][name] = {
+                    "path": path, "sha256": "b" * 64, "image_name": name.removesuffix(".gz"),
+                    "layer_media_types": ["application/vnd.oci.image.layer.v1.tar"],
+                }
         with mock.patch.multiple(driver, ROOT=root, STATE=root / "target/bazel", WORKSPACE=workspace):
-            driver.generate_workspace(request, inventory, sorted(containers), {artifact: {}}, manifest)
+            driver.generate_workspace(request, inventory, sorted(containers), {artifact: {}}, manifest, retained)
         write(workspace / "swss/swss.deb", "fixture SWSS package\n")
         write(workspace / "swss/swss-dbg.deb", "fixture SWSS debug package\n")
         write(workspace / "swss/BUILD.bazel", textwrap.dedent('''\
@@ -199,6 +214,22 @@ class BazelGraphTest(unittest.TestCase):
                     self.assertEqual(set(outputs), set(spec["outputs"]))
                     for logical, path in outputs.items():
                         self.assertTrue(path.startswith("bazel-out/") and path.endswith("/image/" + logical), path)
+
+    def test_generated_oci_vs_graph_replaces_native_container_actions(self):
+        workspace = self.generated_fixture("vs", use_oci=True)
+        graph = json.loads(self.bazel(workspace, "aquery", "deps(//image:sonic_vs)", ["--output=jsonproto"]))
+        actions = [action for action in graph.get("actions", []) if action["mnemonic"].startswith("Sonic")]
+        self.assertEqual(Counter(action["mnemonic"] for action in actions), Counter({
+            "SonicOciExtract": 2, "SonicSwssOverlay": 1, "SonicOciGzip": 2,
+            "SonicHost": 1, "SonicImage": 1, "SonicOnie": 1,
+        }))
+        for action in actions:
+            if action["mnemonic"] in {"SonicOciExtract", "SonicSwssOverlay", "SonicOciGzip"}:
+                self.assertTrue(action["arguments"][0].endswith("/oci_container.py"))
+                self.assertNotIn("no-sandbox", {item["key"] for item in action.get("executionInfo", [])})
+        outputs = self.bazel(workspace, "cquery", "//image:oci_overlay_metadata", ["--output=files"]).splitlines()
+        self.assertEqual(len(outputs), 1)
+        self.assertTrue(outputs[0].endswith("/image/swss_overlay.metadata.json"))
 
 
 if __name__ == "__main__":
