@@ -312,6 +312,44 @@ class OciContainerTest(unittest.TestCase):
         self.assertEqual(outputs[0].read_bytes()[4:8], b"\0\0\0\0")
         self.assertEqual(gzip.decompress(outputs[0].read_bytes()), source.read_bytes())
 
+    def test_extract_accepts_precreated_empty_layout_directory(self):
+        baseline = write_deb(self.root / "baseline.deb")
+        layout = self.root / "docker-test-layout"
+        layout.mkdir()
+        image, output, metadata = self.extract(baseline, "docker-test")
+        self.assertEqual(output, layout)
+        self.assertEqual((layout / "index.json").read_bytes(), image["index"])
+        self.assertEqual(json.loads(metadata.read_text())["image_name"], "docker-test")
+
+    def test_extract_rejects_invalid_layout_destinations(self):
+        baseline = write_deb(self.root / "baseline.deb")
+        image = write_image(self.root / "docker-test.gz", "docker-test", baseline)
+        regular = self.root / "file-layout"
+        regular.write_bytes(b"keep\n")
+        nonempty = self.root / "nonempty-layout"
+        nonempty.mkdir()
+        (nonempty / "keep").write_bytes(b"keep\n")
+        target = self.root / "symlink-target"
+        target.mkdir()
+        symlink = self.root / "symlink-layout"
+        symlink.symlink_to(target, target_is_directory=True)
+        dangling = self.root / "dangling-layout"
+        dangling.symlink_to(self.root / "missing", target_is_directory=True)
+        for layout in (regular, nonempty, symlink, dangling):
+            with self.subTest(layout=layout.name):
+                metadata = self.root / (layout.name + ".json")
+                result = self.command(
+                    "extract", "--archive", image["path"], "--baseline-deb", baseline["path"],
+                    "--archive-sha256", image["sha256"], "--baseline-sha256", baseline["sha256"],
+                    "--image-name", "docker-test", "--layout", layout, "--metadata", metadata, success=False)
+                self.assertIn("OCI layout output must be absent or an empty non-symlink directory", result.stderr)
+                self.assertFalse(metadata.exists())
+        self.assertEqual(regular.read_bytes(), b"keep\n")
+        self.assertEqual((nonempty / "keep").read_bytes(), b"keep\n")
+        self.assertEqual(symlink.readlink(), target)
+        self.assertEqual(dangling.readlink(), self.root / "missing")
+        self.assertEqual(list(target.iterdir()), [])
+
     def test_rejects_incompatible_package_metadata_and_effects(self):
         baseline = write_deb(self.root / "baseline.deb")
         _image, _layout, seed = self.extract(baseline, "docker-test")

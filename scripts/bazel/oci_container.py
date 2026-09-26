@@ -937,7 +937,8 @@ def extract(args):
     package = parse_package(args.baseline_deb, args.baseline_sha256)
     layout, metadata = Path(args.layout), Path(args.metadata)
     layout.parent.mkdir(parents=True, exist_ok=True)
-    require(not layout.exists() and not layout.is_symlink(), "OCI layout output already exists")
+    require(not layout.is_symlink() and (not layout.exists() or (layout.is_dir() and not any(layout.iterdir()))),
+            "OCI layout output must be absent or an empty non-symlink directory")
     temporary = Path(tempfile.mkdtemp(prefix=".oci-layout-", dir=layout.parent))
     try:
         catalog = archive_catalog(args.archive, temporary, args.archive_sha256)
