@@ -554,6 +554,103 @@ def cleanup_host_root(root, environment):
     )
 
 
+def _docker_root_identity(info):
+    return (info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode))
+
+
+def _docker_root_state(info):
+    return _docker_root_identity(info) + (stat.S_IMODE(info.st_mode), info.st_uid, info.st_gid)
+
+
+def _native_namespace_identity():
+    pid = str(os.getpid())
+    if os.readlink("/proc/self") != pid:
+        raise RuntimeError("native Docker root cleanup procfs does not describe the caller PID namespace")
+    result = {}
+    for name in ("mnt", "pid"):
+        current = os.stat("/proc/self/ns/" + name)
+        caller = os.stat("/proc/" + pid + "/ns/" + name)
+        result[name] = (current.st_dev, current.st_ino)
+        if result[name] != (caller.st_dev, caller.st_ino):
+            raise RuntimeError("native Docker root cleanup namespace does not match its procfs caller")
+    return result
+
+
+def _verify_docker_root_mounts(root, info):
+    mountpoints = _native_mountpoints()
+    nested = sorted(str(path) for path in mountpoints if root in path.parents)
+    if nested:
+        raise RuntimeError("native snapshot still contains mounts after action cleanup: " + ", ".join(nested[:8]))
+    # Makefile.work binds this directory to the outer slave's Docker data root.
+    # That bind and dockerd remain until the slave exits; only task mounts below
+    # the source root must already be gone.
+    alias = Path("/var/lib/docker")
+    if alias not in mountpoints:
+        raise RuntimeError("native Docker data-root bind is missing")
+    alias_info = alias.lstat()
+    if not stat.S_ISDIR(alias_info.st_mode) or _docker_root_state(alias_info) != _docker_root_state(info):
+        raise RuntimeError("native Docker data-root bind does not match the task-owned directory")
+
+
+def _verify_docker_root_location(root, path, descriptor_path, info, identity, namespaces):
+    if _native_namespace_identity() != namespaces:
+        raise RuntimeError("native Docker root cleanup namespace changed")
+    if (_docker_root_state(path.lstat()) != _docker_root_state(info) or
+            _docker_root_state(os.stat(descriptor_path)) != _docker_root_state(info)):
+        raise RuntimeError("native Docker root path or procfs descriptor changed")
+    _verify_docker_root_mounts(root, info)
+    validate_native_snapshot(root, identity)
+
+
+def release_docker_root_ownership(root, identity, environment):
+    """Return only the finished slave Docker root directory to the build user."""
+    root = Path(root)
+    uid, gid = os.getuid(), os.getgid()
+    if uid == 0 or os.getresuid() != (uid,) * 3 or os.getresgid() != (gid,) * 3:
+        raise RuntimeError("native Docker root cleanup requires ordinary build-user credentials")
+    if not root.is_absolute() or root.resolve() != root or not hasattr(os, "O_PATH"):
+        raise RuntimeError("native Docker root cleanup requires a canonical native root and Linux O_PATH")
+    lock_path = native_path(root, "target/bazel/native-actions.lock")
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        validate_native_snapshot(root, identity)
+        path = root / "fsroot.docker.trixie"
+        before = path.lstat()
+        mode = stat.S_IMODE(before.st_mode)
+        owner = (before.st_uid, before.st_gid)
+        if (not stat.S_ISDIR(before.st_mode) or owner not in {(0, 0), (uid, gid)} or
+                not mode & 0o200 or before.st_dev != identity["device"]):
+            raise RuntimeError("native Docker root must be a root or build-user owned directory with owner write access on the native source filesystem")
+        descriptor = os.open(path, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            opened = os.fstat(descriptor)
+            if _docker_root_state(opened) != _docker_root_state(before):
+                raise RuntimeError("native Docker root changed while pinning it")
+            namespaces = _native_namespace_identity()
+            descriptor_path = "/proc/" + str(os.getpid()) + "/fd/" + str(descriptor)
+            # The action lock is released only after image-worker PID 1 is
+            # reaped. Check that no image chroot process or mount survived.
+            subprocess.run(
+                ["sudo", "-n", "--", "python3", "-B", "scripts/bazel/native/host_snapshot.py", "assert-clean", "fsroot-vs"],
+                cwd=root, env=environment, check=True,
+            )
+            _verify_docker_root_location(root, path, descriptor_path, opened, identity, namespaces)
+            # The procfs path refers to this pinned O_PATH inode, even if its
+            # name is replaced. --from guards the owner at the operation itself.
+            if owner == (0, 0):
+                subprocess.run(
+                    ["sudo", "-n", "--", "chown", "--dereference", "--from=0:0", str(uid) + ":" + str(gid), "--", descriptor_path],
+                    cwd=root, env=environment, check=True,
+                )
+            after = os.fstat(descriptor)
+            if (_docker_root_identity(after) != _docker_root_identity(opened) or
+                    stat.S_IMODE(after.st_mode) != mode or (after.st_uid, after.st_gid) != (uid, gid)):
+                raise RuntimeError("native Docker root ownership readback changed its identity, mode, or owner")
+            _verify_docker_root_location(root, path, descriptor_path, after, identity, namespaces)
+        finally:
+            os.close(descriptor)
+
+
 def image_worker_limits():
     identifiers = sorted({
         getattr(resource, name) for name in dir(resource)

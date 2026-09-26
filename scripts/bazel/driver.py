@@ -780,18 +780,7 @@ def build(request, inv, manifest, retained=None, contract=None, container_static
     print("Bazel artifacts: " + str(artifact_dir), flush=True)
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--request", type=Path, required=True)
-    args = parser.parse_args()
-    request = load_json(args.request)
-    if request.get("schema") != 1 or request.get("target") not in {"swss", "container", "vs", "vs-kvm"} or request.get("phase") not in {"prepare", "build"}:
-        raise RuntimeError("invalid SONiC Bazel build request")
-    if ROOT != Path("/sonic"):
-        raise RuntimeError("driver.py must run in the public sonic-slave at /sonic")
-    runtime_identity = native_action.load_native_snapshot_identity(ROOT)
-    if runtime_identity != request.get("native_snapshot_identity"):
-        raise RuntimeError("native snapshot identity does not match the launcher request")
+def run_driver_phase(request):
     request["_native_environment"], request["_private_environment"], request["_native_make_variables"] = capture_environment()
     request["_native_make_variables"].update({key: str(value) for key, value in request["make_variables"].items()})
     image = "sonic-vs.img.gz" if request["target"] == "vs-kvm" else "sonic-vs.bin"
@@ -813,6 +802,37 @@ def main():
         print("Container construction: " + ("verified retained OCI layers" if retained else "native Docker baseline for the current inputs"), flush=True)
     generate_workspace(request, inv, owned, artifacts, manifest, retained, contract, container_static)
     build(request, inv, manifest, retained, contract, container_static)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--request", type=Path, required=True)
+    args = parser.parse_args()
+    request = load_json(args.request)
+    if request.get("schema") != 1 or request.get("target") not in {"swss", "container", "vs", "vs-kvm"} or request.get("phase") not in {"prepare", "build"}:
+        raise RuntimeError("invalid SONiC Bazel build request")
+    if ROOT != Path("/sonic"):
+        raise RuntimeError("driver.py must run in the public sonic-slave at /sonic")
+    runtime_identity = native_action.load_native_snapshot_identity(ROOT)
+    if runtime_identity != request.get("native_snapshot_identity"):
+        raise RuntimeError("native snapshot identity does not match the launcher request")
+    cleanup_environment = os.environ.copy()
+    failure = None
+    try:
+        run_driver_phase(request)
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        try:
+            native_action.release_docker_root_ownership(ROOT, runtime_identity, cleanup_environment)
+        except BaseException as error:
+            if failure is not None:
+                raise RuntimeError(
+                    "native Docker root cleanup failed after " + type(failure).__name__ + ": " + str(failure) +
+                    "; cleanup: " + str(error)
+                ) from error
+            raise
 
 
 if __name__ == "__main__":
