@@ -505,22 +505,24 @@ def build(request, inv, manifest):
         "swss": "//swss:swss_deb", "container": "//image:swss_container",
         "vs": "//image:sonic_vs", "vs-kvm": "//image:sonic_vs_kvm",
     }[request["target"]]
+    labels = {"//swss:swss_deb": 1, "//swss:swss_dbg_deb": 1, "//swss:swss_package_manifest": 1}
+    if request["target"] != "swss":
+        labels["//image:swss_container"] = 1
+    if request["target"] in {"vs", "vs-kvm"}:
+        labels[target] = 2 if request["target"] == "vs-kvm" else 1
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     log_dir = STATE / "logs" / stamp
     log_dir.mkdir(parents=True, exist_ok=True)
     bazel = ["bazel", "--nosystem_rc", "--nohome_rc"]
     environment = build_environment(request)
     environment["PWD"] = str(WORKSPACE)
+    # cquery reports paths without materializing cached outputs. Request every
+    # collected artifact as a top-level build output before querying its path.
     command = bazel + [
         "build", "--profile=" + str(log_dir / "profile.json.gz"),
         "--execution_log_json_file=" + str(log_dir / "execution.json"),
-    ] + request["bazel_args"] + [target, "//swss:swss_dbg_deb"]
+    ] + request["bazel_args"] + list(labels)
     run(command, cwd=WORKSPACE, env=environment)
-    labels = {"//swss:swss_deb": 1, "//swss:swss_dbg_deb": 1, "//swss:swss_package_manifest": 1}
-    if request["target"] != "swss":
-        labels["//image:swss_container"] = 1
-    if request["target"] in {"vs", "vs-kvm"}:
-        labels[target] = 2 if request["target"] == "vs-kvm" else 1
     artifact_dir = STATE / "artifacts" / request["target"]
     artifact_dir.mkdir(parents=True, exist_ok=True)
     outputs = {}
