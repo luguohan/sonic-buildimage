@@ -6,6 +6,7 @@ module(
 bazel_dep(name = "buildifier_prebuilt", version = "8.5.1.3", dev_dependency = True)
 
 bazel_dep(name = "rules_cc", version = "0.2.14")
+bazel_dep(name = "rules_python", version = "1.7.0")
 bazel_dep(name = "tar.bzl", version = "0.10.5")
 bazel_dep(name = "bazel_lib", version = "3.1.1")
 
@@ -35,7 +36,7 @@ http_archive(
     build_file = "//:libdbus_bin.BUILD",
     sha256 = "8682fad507dc508219f5b24a7f3b922b9ae527b8f16436dfc4559035e852cdd5",
     strip_prefix = "libdbus-c++-bin_0.9.0-11",
-    urls = ["http://debian-archive.trafficmanager.net/debian/pool/main/d/dbus-c++/libdbus-c++-bin_0.9.0-11_amd64.deb"],
+    urls = ["https://deb.debian.org/debian/pool/main/d/dbus-c++/libdbus-c++-bin_0.9.0-11_amd64.deb"],
 )
 
 extract_tar = use_repo_rule("@sonic_build_infra//tar:extract_tar.bzl", "extract_tar")

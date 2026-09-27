@@ -1,5 +1,5 @@
 # Try to read from sonic-bazel-registry, for modules maintained by SONiC
-common --registry=https://raw.githubusercontent.com/blorente/sonic-bazel-registry/main
+common --registry=https://raw.githubusercontent.com/securely1g/sonic-bazel-registry/main
 # After that, read from upstream sources.
 common --registry=https://raw.githubusercontent.com/aspect-build/bazel-central-registry/aspect_rules_py-v1.7.1
 common --registry=https://bcr.bazel.build

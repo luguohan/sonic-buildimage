@@ -133,5 +133,6 @@ sources.list.*
 apt-retries-count
 
 # Bazel
+/bazel-*
 MODULE.bazel.lock
 user.bazelrc

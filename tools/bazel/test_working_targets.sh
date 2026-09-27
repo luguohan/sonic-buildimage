@@ -65,7 +65,8 @@ for image in ${docker_images}; do
       echo "[docker-make] ${archive}"
 
       rm -f "target/${archive}"
-      BUILD_WITH_BAZEL_WHEN_AVAILABLE=true \
+      BUILD_WITH_BAZEL_WHEN_AVAILABLE=y \
+        NOBOOKWORM=1 \
         BLDENV=trixie \
         make "target/${archive}"
     done

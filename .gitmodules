@@ -1,7 +1,6 @@
 [submodule "sonic-swss-common"]
   path = src/sonic-swss-common
-  # TODO BL: move it back to sonic-net when we're done publishing.
-	url = https://github.com/blorente/sonic-swss-common
+	url = https://github.com/securely1g/sonic-swss-common
 [submodule "sonic-linux-kernel"]
 	path = src/sonic-linux-kernel
 	url = https://github.com/sonic-net/sonic-linux-kernel
@@ -162,4 +161,4 @@
 
 [submodule "src/sonic-build-infra"]
 	path = src/sonic-build-infra
-	url = https://github.com/blorente/sonic-build-infra
+	url = https://github.com/securely1g/sonic-build-infra

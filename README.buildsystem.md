@@ -199,6 +199,31 @@ The image is still registered in `SONIC_DOCKER_IMAGES` / `SONIC_INSTALL_DOCKER_I
 
 Bazel currently only supports trixie-based images.
 
+For example, build the sysmgr image with Bazel while disabling the default Bookworm build:
+
+```sh
+make NOBOOKWORM=1 BUILD_WITH_BAZEL_WHEN_AVAILABLE=y target/docker-sysmgr.gz
+```
+
+For a direct Bazel build on AMD64, initialize the required submodules and provide
+`target/docker-config-engine-trixie.gz` from a Trixie Make build (or a previously
+built archive with known provenance). Bazel imports that base image; it does not
+build the full SONiC installer.
+
+```sh
+git submodule update --init src/sonic-build-infra src/sonic-swss-common src/sonic-sysmgr/gnoi
+bazel build //dockers/docker-sysmgr:docker-sysmgr.gz \
+    @sonic_sysmgr//:sysmgr_deb @sonic_sysmgr//:sysmgr-dbg_deb
+bazel run //dockers/docker-sysmgr:write_docker-sysmgr.gz
+bazel test //dockers/docker-sysmgr:debug_symbols_test
+```
+
+The debug container is `//dockers/docker-sysmgr:docker-sysmgr-dbg.gz`. It also
+needs the prebuilt FIPS packages pinned in `src/sonic-fips/MODULE.bazel`; these
+are separate from the split symbols in `sysmgr-dbg_deb`. The root Bazel build
+currently disables YANG. See [the Bazel guide](tools/bazel/docs/README.bazel.md)
+for the build graph and component workflow.
+
 Define:
 
 ```make

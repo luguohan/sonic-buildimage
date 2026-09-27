@@ -29,7 +29,7 @@ libnl3_src(
     ],
     sha256 = "9fe43ccbeeea72c653bdcf8c93332583135cda46a79507bfd0a483bb57f65939",
     strip_prefix = "libnl-3.7.0",
-    urls = ["http://debian-archive.trafficmanager.net/debian/pool/main/libn/libnl3/libnl3_3.7.0.orig.tar.gz"],
+    urls = ["https://deb.debian.org/debian/pool/main/libn/libnl3/libnl3_3.7.0.orig.tar.gz"],
 )
 
 bazel_dep(name = "rules_flex", version = "0.4")

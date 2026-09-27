@@ -1,3 +1,4 @@
+load("@rules_python//python:py_binary.bzl", "py_binary")
 load("@sonic_build_infra//deb:sonic_deb.bzl", "sonic_deb")
 load("@sonic_build_infra//tar:sonic_deploy_tar.bzl", "sonic_deploy_tar")
 
@@ -5,8 +6,8 @@ sonic_deploy_tar(
     name = "sysmgr_pkg",
     srcs = ["//rebootbackend"],
     binaries = {
-        "./usr/bin/rebootbackend type=file": "//rebootbackend:rebootbackend",
-        "./usr/lib/x86_64-linux-gnu/librebootgnoi.so.0.0.0 type=file": "//rebootbackend:librebootgnoi.so.0.0.0",
+        "./usr/bin/rebootbackend type=file uid=0 gid=0 mode=0755 time=0": "//rebootbackend:rebootbackend",
+        "./usr/lib/x86_64-linux-gnu/librebootgnoi.so.0.0.0 type=file uid=0 gid=0 mode=0644 time=0": "//rebootbackend:librebootgnoi.so.0.0.0",
     },
     force_debug_build = True,
     mtree = [
@@ -38,9 +39,27 @@ sonic_deb(
     visibility = ["//visibility:public"],
 )
 
+py_binary(
+    name = "root_owned_tar",
+    srcs = ["tools/bazel/root_owned_tar.py"],
+    main = "tools/bazel/root_owned_tar.py",
+    visibility = ["//visibility:public"],
+)
+
+# The debug tar's generated parent entries can inherit the build user's owner.
+# Normalize the headers before including them in a package or an OCI layer.
+genrule(
+    name = "sysmgr_debug_pkg",
+    srcs = [":sysmgr_pkg.debug_symbols"],
+    outs = ["sysmgr_debug_pkg.tar"],
+    cmd = '$(location :root_owned_tar) "$(location :sysmgr_pkg.debug_symbols)" "$@"',
+    tools = [":root_owned_tar"],
+    visibility = ["//visibility:public"],
+)
+
 sonic_deb(
     name = "sysmgr-dbg_deb",
-    data = ":sysmgr_pkg.debug_symbols",
+    data = ":sysmgr_debug_pkg",
     depends = ["sysmgr (= 1.0.0)"],
     description = "debugging symbols for sysmgr",
     maintainer = "Runming Wu <runmingwu@google.com>",

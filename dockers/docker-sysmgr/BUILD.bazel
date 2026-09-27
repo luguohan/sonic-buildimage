@@ -1,6 +1,7 @@
 load("@bazel_lib//lib:expand_template.bzl", "expand_template")
 load("@bazel_skylib//rules:write_file.bzl", "write_file")
 load("@rules_oci//oci:defs.bzl", "oci_image")
+load("@rules_python//python:py_test.bzl", "py_test")
 load("@sonic_build_infra//oci:debug_symbols_layer.bzl", "debug_symbols_layer")
 load("@tar.bzl", "tar")
 load("//tools/bazel/dpkg:defs.bzl", "sonic_layer")
@@ -17,7 +18,7 @@ write_file(
     out = "config_status",
     content = [
         "# Config files managed by sonic-config-engine",
-        "", # Intentional trailing newline
+        "",  # Intentional trailing newline
     ],
 )
 
@@ -52,11 +53,11 @@ tar(
         ":rsyslog_conf_gen",
     ],
     mtree = [
-        "./etc/rsyslog.conf time=0 type=file content=$(location :rsyslog_conf_gen)",
-        "./etc/supervisor/conf.d/supervisord.conf time=0 type=file content=$(location :supervisord.conf)",
-        "./etc/supervisor/critical_processes time=0 type=file content=$(location :critical_processes)",
-        "./var/sonic type=dir time=0",
-        "./var/sonic/config_status time=0 type=file content=$(location :config_status_gen)",
+        "./etc/rsyslog.conf uid=0 gid=0 mode=0644 time=0 type=file content=$(location :rsyslog_conf_gen)",
+        "./etc/supervisor/conf.d/supervisord.conf uid=0 gid=0 mode=0644 time=0 type=file content=$(location :supervisord.conf)",
+        "./etc/supervisor/critical_processes uid=0 gid=0 mode=0644 time=0 type=file content=$(location :critical_processes)",
+        "./var/sonic uid=0 gid=0 mode=0755 type=dir time=0",
+        "./var/sonic/config_status uid=0 gid=0 mode=0644 time=0 type=file content=$(location :config_status_gen)",
     ],
 )
 
@@ -89,8 +90,31 @@ sonic_docker_archive(
 )
 
 debug_symbols_layer(
-    name = "docker-sysmgr.debug_symbols",
+    name = "docker-sysmgr.debug_symbols_raw",
     image = ":docker-sysmgr",
+)
+
+genrule(
+    name = "docker-sysmgr.debug_symbols",
+    srcs = [":docker-sysmgr.debug_symbols_raw"],
+    outs = ["docker-sysmgr.debug_symbols.tar"],
+    cmd = '$(location @sonic_sysmgr//:root_owned_tar) "$(location :docker-sysmgr.debug_symbols_raw)" "$@"',
+    tools = ["@sonic_sysmgr//:root_owned_tar"],
+    visibility = ["//visibility:public"],
+)
+
+py_test(
+    name = "debug_symbols_test",
+    size = "small",
+    srcs = ["debug_symbols_test.py"],
+    args = [
+        "$(location :docker-sysmgr.debug_symbols)",
+        "$(location :source_files)",
+    ],
+    data = [
+        ":docker-sysmgr.debug_symbols",
+        ":source_files",
+    ],
 )
 
 oci_image(

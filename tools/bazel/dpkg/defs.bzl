@@ -5,6 +5,7 @@ It lives here for now because the file is in //dockers/docker-base-trixie.
 """
 
 load("@rules_distroless//distroless:defs.bzl", "flatten")
+load("@sonic_build_infra//binary:debug_symbols.bzl", "DebugSymbolsInfo")
 load("@tar.bzl//tar:tar.bzl", "tar_lib")
 
 _EXCLUDES = "//tools/bazel/dpkg:dpkg_excludes.txt"
@@ -61,7 +62,18 @@ def _dpkg_filter_impl(ctx):
     output = ctx.actions.declare_file(ctx.attr.name + ".tar")
     _copy(ctx, "DpkgMerge", bsdtar, output, [excluded, included])
 
-    return [DefaultInfo(files = depset([output]))]
+    # flatten and this filter must not hide the original archives' debug trees.
+    # The image collector traverses base/tars edges, so it stops at our src edge
+    # and relies on this provider to retain the corresponding deployed symbols.
+    debug_deps = [ctx.attr.src] + ctx.attr.debug_symbol_deps
+    return [
+        DefaultInfo(files = depset([output])),
+        DebugSymbolsInfo(symbols = depset(transitive = [
+            dep[DebugSymbolsInfo].symbols
+            for dep in debug_deps
+            if DebugSymbolsInfo in dep
+        ])),
+    ]
 
 dpkg_filter = rule(
     doc = """Drop from a layer the paths the base image's dpkg config excludes.
@@ -76,6 +88,10 @@ So we need to build the excluded first, then the included, and then merge them.
             doc = "The layer to filter.",
             allow_single_file = tar_lib.common.accepted_tar_extensions,
             mandatory = True,
+        ),
+        "debug_symbol_deps": attr.label_list(
+            doc = "Original archives whose debug metadata must survive flattening and filtering.",
+            allow_files = True,
         ),
         "excludes": attr.label_list(
             doc = "Files of bsdtar exclude patterns, one per line.",
@@ -112,5 +128,6 @@ def sonic_layer(name, tars, deduplicate = True, **kwargs):
     dpkg_filter(
         name = name,
         src = name + "_unfiltered",
+        debug_symbol_deps = tars,
         **kwargs
     )

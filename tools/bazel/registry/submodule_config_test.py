@@ -5,7 +5,9 @@ Run with --fix (note `bazel run`, not `bazel test`) to regenerate the file from 
 """
 
 import argparse
+import re
 import sys
+from pathlib import Path
 
 import registry_lib
 
@@ -22,7 +24,7 @@ def find_submodule_bazel_modules() -> list[tuple[str, str]]:
 # submodule-config.bazelrc is only ever imported by a submodule directly under src/
 # (e.g. src/sonic-swss-common), so %workspace% is always 2 levels below the repo root
 # when these lines are evaluated.
-OVERRIDE_MODULE_DOTS = "../../.."
+OVERRIDE_MODULE_DOTS = "../.."
 
 
 def render_entry(submodule_path: str, name: str) -> str:
@@ -31,6 +33,22 @@ def render_entry(submodule_path: str, name: str) -> str:
 # Override {name} with a local checkout of {submodule_path}.
 common:unpinned-{name} --override_module={name}=%workspace%/{OVERRIDE_MODULE_DOTS}/{submodule_path}
 """
+
+
+def validate_override_paths(config: str, modules: list[tuple[str, str]]) -> None:
+    """Check where the rendered overrides resolve from each importing module."""
+    overrides = dict(re.findall(r"--override_module=([^=\s]+)=(\S+)", config))
+    for importer_path, _ in modules:
+        workspace = registry_lib.REPO_ROOT / importer_path
+        for target_path, name in modules:
+            actual = Path(overrides[name].replace("%workspace%", str(workspace))).resolve()
+            expected = (registry_lib.REPO_ROOT / target_path).resolve()
+            if actual != expected:
+                raise ValueError(
+                    f"Override for {name} from {importer_path} resolves to {actual}, "
+                    f"expected {expected}"
+                )
+
 
 HEADER = """\
 # ==============================================================================
@@ -72,6 +90,7 @@ def main() -> None:
 
     modules = find_submodule_bazel_modules()
     updated = HEADER + "".join(render_entry(path, name) for path, name in modules)
+    validate_override_paths(updated, modules)
 
     if SUBMODULE_CONFIG.exists() and SUBMODULE_CONFIG.read_text() == updated:
         print(f"Nothing to do: {SUBMODULE_CONFIG} is already up to date.")

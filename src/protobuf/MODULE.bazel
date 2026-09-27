@@ -22,7 +22,7 @@ extract_tar = use_repo_rule("@sonic_build_infra//tar:extract_tar.bzl", "extract_
 # Both architectures are fetched unconditionally, and BUILD.bazel selects between them.
 #
 # TODO(bazel-ready): Implement cross-compiling, which would require protoc for the exec config and libprotobuf for the target config.
-PROTOBUF_DEB = "http://debian-archive.trafficmanager.net/debian/pool/main/p/protobuf"
+PROTOBUF_DEB = "https://deb.debian.org/debian/pool/main/p/protobuf"
 
 VERSION = "3.21.12-11+deb13u1"
 
