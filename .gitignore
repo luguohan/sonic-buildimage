@@ -131,3 +131,7 @@ sources.list.*
 
 # Generated mirror configs
 apt-retries-count
+
+# Bazel
+MODULE.bazel.lock
+user.bazelrc
