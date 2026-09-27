@@ -168,6 +168,12 @@ include $(RULES_PATH)/config
 -include $(RULES_PATH)/config.organization
 -include $(RULES_PATH)/config.user
 
+ifeq ($(BUILD_WITH_BAZEL_WHEN_AVAILABLE),y)
+ifneq ($(BLDENV),trixie)
+$(error BUILD_WITH_BAZEL_WHEN_AVAILABLE=y only supports BLDENV=trixie (got '$(BLDENV)'))
+endif
+endif
+
 ifneq ($(strip $(SONIC_EXTRA_EXPORT_VARS)),)
 export $(SONIC_EXTRA_EXPORT_VARS)
 endif
@@ -1503,17 +1509,40 @@ $(addprefix $(TARGET_PATH)/, $(DOCKER_IMAGES)) : $(TARGET_PATH)/%.gz : .platform
 
 SONIC_TARGET_LIST += $(addprefix $(TARGET_PATH)/, $(DOCKER_IMAGES))
 
+# Let Bazel check its inputs whenever Make requests one of its images. Publish
+# changed archives atomically and preserve unchanged archive timestamps so
+# downstream Make targets remain incremental.
+.PHONY: bazel-docker-force
+bazel-docker-force:
+
+define build-bazel-docker
+	bazel build //dockers/$(1):$(2) $(LOG)
+	bazel_bin=$$(bazel info bazel-bin)
+	(
+		bazel_archive="$$bazel_bin/dockers/$(1)/$(2)"
+		if [ -f "$@" ] && [ ! -L "$@" ] && cmp -s "$$bazel_archive" "$@"; then
+			if [ "$$(stat -c %a "$@")" != 644 ]; then chmod 0644 "$@"; fi
+			exit 0
+		fi
+		mkdir -p "$(@D)"
+		bazel_archive_tmp=$$(mktemp "$@.tmp.XXXXXX")
+		trap 'rm -f "$$bazel_archive_tmp"' EXIT
+		install -m 0644 -T "$$bazel_archive" "$$bazel_archive_tmp"
+		mv -fT "$$bazel_archive_tmp" "$@"
+	)
+endef
+
 # Targets for building docker images (and debug images) with Bazel.
-$(addprefix $(TARGET_PATH)/, $(SONIC_BAZEL_DOCKER_IMAGES)) : $(TARGET_PATH)/%.gz : .platform \
+$(addprefix $(TARGET_PATH)/, $(SONIC_BAZEL_DOCKER_IMAGES)) : $(TARGET_PATH)/%.gz : .platform bazel-docker-force \
 		$$(addprefix $(TARGET_PATH)/,$$($$*.gz_BAZEL_BASE))
 	$(HEADER)
-	bazel run //dockers/$*:write_$*.gz $(LOG)
+	$(call build-bazel-docker,$*,$*.gz)
 	$(FOOTER)
 
-$(addprefix $(TARGET_PATH)/, $(SONIC_BAZEL_DBG_DOCKER_IMAGES)) : $(TARGET_PATH)/%-$(DBG_IMAGE_MARK).gz : .platform \
+$(addprefix $(TARGET_PATH)/, $(SONIC_BAZEL_DBG_DOCKER_IMAGES)) : $(TARGET_PATH)/%-$(DBG_IMAGE_MARK).gz : .platform bazel-docker-force \
 		$$(addprefix $(TARGET_PATH)/,$$($$*.gz_BAZEL_BASE))
 	$(HEADER)
-	bazel run //dockers/$*:write_$*-$(DBG_IMAGE_MARK).gz $(LOG)
+	$(call build-bazel-docker,$*,$*-$(DBG_IMAGE_MARK).gz)
 	$(FOOTER)
 
 SONIC_TARGET_LIST += $(addprefix $(TARGET_PATH)/, $(SONIC_BAZEL_DOCKER_IMAGES))
@@ -1593,7 +1622,9 @@ DOCKER_LOAD_TARGETS = $(addsuffix -load,$(addprefix $(TARGET_PATH)/, \
 		      $(DOWNLOADED_DOCKER_IMAGES) \
 		      $(COPY_DOCKER_IMAGES) \
 		      $(DOCKER_IMAGES) \
-		      $(DOCKER_DBG_IMAGES)))
+		      $(SONIC_BAZEL_DOCKER_IMAGES) \
+		      $(DOCKER_DBG_IMAGES) \
+		      $(SONIC_BAZEL_DBG_DOCKER_IMAGES)))
 
 ifeq ($(BLDENV),trixie)
 DOCKER_LOAD_TARGETS += $(addsuffix -load,$(addprefix $(TARGET_PATH)/, \

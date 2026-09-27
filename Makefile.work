@@ -169,6 +169,12 @@ include rules/config
 -include rules/config.user
 include rules/sonic-fips.mk
 
+ifeq ($(BUILD_WITH_BAZEL_WHEN_AVAILABLE),y)
+ifneq ($(BLDENV),trixie)
+$(error BUILD_WITH_BAZEL_WHEN_AVAILABLE=y only supports BLDENV=trixie (got '$(BLDENV)'))
+endif
+endif
+
 ifneq ($(DEFAULT_CONTAINER_REGISTRY),)
 override DEFAULT_CONTAINER_REGISTRY := $(DEFAULT_CONTAINER_REGISTRY)/
 endif
@@ -245,8 +251,7 @@ export SONIC_VERSION_CACHE SONIC_VERSION_CACHE_SOURCE
 $(shell test -d $(SONIC_VERSION_CACHE_SOURCE) || \
     mkdir -p $(SONIC_VERSION_CACHE_SOURCE) && chmod -f 777 $(SONIC_VERSION_CACHE_SOURCE) 2>/dev/null )
 
-$(shell test -d $(SONIC_BAZEL_CACHE_SOURCE) || \
-    mkdir -p $(SONIC_BAZEL_CACHE_SOURCE) && chmod -f 777 $(SONIC_BAZEL_CACHE_SOURCE) 2>/dev/null )
+$(shell mkdir -p -m 0777 "$(SONIC_BAZEL_CACHE_SOURCE)" 2>/dev/null)
 
 # Generate the version control build info
 $(shell \

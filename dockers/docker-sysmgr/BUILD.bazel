@@ -120,7 +120,6 @@ py_test(
 oci_image(
     name = "docker-sysmgr-dbg",
     base = ":docker-sysmgr",
-    entrypoint = ["/usr/bin/bash"],
     env = {
         "DEBIAN_FRONTEND": "noninteractive",
     },

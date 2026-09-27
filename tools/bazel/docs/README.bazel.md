@@ -59,7 +59,7 @@ Even when building with Bazel, Docker images for SONiC services are driven by th
 There are two mechanisms for this:
 
 - The `BUILD_WITH_BAZEL_WHEN_AVAILABLE` Flag: A global flag that toggles whether every container that could be built with Bazel should be built with Bazel.
-- The `SONIC_BAZEL_DOCKER_IMAGES` Make Target: A new target type that will use `bazel build` to build the containers, instead of Make. [Documentation](/README.buildsystem.md#sonic-bazel-docker-images).
+- The `SONIC_BAZEL_DOCKER_IMAGES` Make Target: A new target type that will use `bazel build` to build the containers, instead of Make. [Documentation](/README.buildsystem.md#bazel-docker-images).
 
 To mark a container as buildable with Bazel, add it to `SONIC_BAZEL_DOCKER_IMAGES` only if `BUILD_WITH_BAZEL_WHEN_AVAILABLE` is enabled:
 

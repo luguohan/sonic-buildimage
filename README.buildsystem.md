@@ -189,10 +189,10 @@ $(SOME_DOCKER)_LOAD_DOCKERS += $(SOME_OTHER_DOCkER) # docker image from which th
 SONIC_DOCKER_IMAGES += $(SOME_DOCKER) # add docker to this group
 ```
 
-<a id="sonic-bazel-docker-images"></a>
-**SONIC_BAZEL_DOCKER_IMAGES**
-Target group for docker images that are built with [Bazel](https://bazel.build/) instead of the legacy `docker build` flow.
-A docker in this group is built by running `bazel run //dockers/<name>:write_<name>.gz`, which produces the same `target/<name>.gz` artifact as the normal docker rule.
+#### Bazel Docker images
+
+The `SONIC_BAZEL_DOCKER_IMAGES` target group contains docker images built with [Bazel](https://bazel.build/).
+Whenever Make requests an image in this group, it runs `bazel build //dockers/<name>:<name>.gz` so Bazel can check its declared inputs. Make atomically publishes changed archives to `target/<name>.gz` and preserves the file timestamp when the archive is unchanged.
 This is opt-in: a recipe only registers the image here when `BUILD_WITH_BAZEL_WHEN_AVAILABLE=y` (see **rules/config**).
 
 The image is still registered in `SONIC_DOCKER_IMAGES` / `SONIC_INSTALL_DOCKER_IMAGES`, and still carries `_PATH`, `_VERSION` and `_PACKAGE_NAME`, so it is installed and listed in the sonic-package-manager catalog exactly as a Make-built one.
@@ -238,8 +238,9 @@ SONIC_INSTALL_DOCKER_IMAGES += $(SOME_DOCKER) # install it into the final image
 ```
 
 Two configuration knobs in **rules/config** control this flow:
+
 * **BUILD_WITH_BAZEL_WHEN_AVAILABLE** (default `n`): When set to `y`, eligible dockers are built with Bazel rather than the legacy `docker build` flow.
-* **SONIC_BAZEL_CACHE_SOURCE** (default `$(SONIC_DPKG_CACHE_SOURCE)/bazel`): Host directory used to persist Bazel's disk and repository caches across slave container runs. Will be mounted into the slave as a volume.
+* **SONIC_BAZEL_CACHE_SOURCE** (default `$(SONIC_DPKG_CACHE_SOURCE)/bazel`): Host directory used to persist Bazel's disk and repository caches across slave container runs. It is mounted into the slave as a volume. Existing directory permissions are preserved; choose a directory writable by the build user. Bazel server and output state stay in the default per-user directory inside each container.
 
 ## Tips & Tricks
 Although every target is built inside a sonic-slave container, which exits at the end of build, you can enter bash of sonic-slave using this command:
