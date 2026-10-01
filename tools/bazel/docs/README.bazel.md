@@ -434,3 +434,34 @@ See more details [here](/tools/bazel/docs/patterns-detail.md#remote-caching).
 > This section will detail how to apply patches to SONiC Components.
 > However, it is under construction until we settle on an approach to versioning components like `sonic-swss-common`.
 > Please email the SONiC Build Working Group if you'd like specific guidance.
+
+## Sysmgr pull request CI
+
+The `Bazel sysmgr` GitHub Actions workflow runs for every pull request (including
+stacked bases), pushes to `master`, and manual runs. Its native AMD64 jobs use
+Bazel 8.5.1 in digest-pinned Debian Trixie, initialize the recorded infrastructure,
+SWSS Common and gNOI gitlinks, and use the checkout's AMD64 Trixie platform.
+
+- `Bazel sysmgr checks (AMD64)` runs formatting, both source-tree registry
+  configuration checks and five explicit Bazel tests for the registry,
+  equivalence checker, OCI conversion and dpkg filter patterns.
+- `Bazel sysmgr packages (AMD64)` compiles sysmgr and its gNOI library from source,
+  builds the runtime and debug Debian packages, and validates their AMD64 ELF
+  architecture, SONAME links, modes, build IDs, detached DWARF and debug-link CRCs.
+  It compares those packages with the production runtime layer and collected
+  debug layer, and runs the existing two layer ownership/configuration checks.
+
+The workflow retains the five required packages/layers, revision and gitlink
+receipts, SHA256 digests, command logs, test results and build profile for 14 days.
+To reproduce inside the same Trixie environment after initializing the gitlinks:
+
+```sh
+bazel run --lockfile_mode=off //tools/bazel/buildifier:buildifier.check
+python3 tools/bazel/ci/sysmgr/run.py test --artifacts artifacts/test
+python3 tools/bazel/ci/sysmgr/run.py build --artifacts artifacts/build
+```
+
+CI builds the sysmgr contribution without a Make-built config-engine base.
+The full runtime/debug OCI images and VS installer remain separate integration
+validation requiring their documented predecessor artifacts. CI does not claim
+ARM support, service/reboot execution, or symbols for imported base contents.

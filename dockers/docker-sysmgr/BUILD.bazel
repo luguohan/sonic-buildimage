@@ -67,6 +67,7 @@ sonic_layer(
         # libswsscommon (and libnl3/libyang3) come from the config-engine base.
         "@sonic_sysmgr//:sysmgr_pkg",
     ],
+    visibility = ["//tools/bazel/ci/sysmgr:__pkg__"],
 )
 
 oci_image(

@@ -1,0 +1,86 @@
+name: Bazel sysmgr
+
+on:
+  # Include draft PRs and stacked bases, such as codex/sysmgr-pr1-base.
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bazel-sysmgr-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: test
+            name: Bazel sysmgr checks (AMD64)
+            timeout: 30
+          - mode: build
+            name: Bazel sysmgr packages (AMD64)
+            timeout: 90
+    # Match the execution ABI of the pinned Trixie compiler and Rust tools.
+    container: debian:trixie-20260918@sha256:9cc080028c43b27d2074d63a5f9caf7166d731494965616c1a6d2827a004585c
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install execution tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            autoconf automake binutils build-essential busybox ca-certificates \
+            git libtool make pigz pkg-config python3 tar unzip
+
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Initialize the recorded Bazel component sources
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git submodule update --init --depth 1 --jobs 4 -- \
+            src/sonic-build-infra src/sonic-swss-common src/sonic-sysmgr/gnoi
+
+      - name: Set up Bazel
+        uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # 0.19.0
+        with:
+          bazelisk-version: 1.29.0
+          bazelisk-cache: true
+          repository-cache: true
+          disk-cache: buildimage-sysmgr-${{ matrix.mode }}-amd64
+          cache-version: "8.5.1"
+
+      - name: Check Bazel formatting
+        if: matrix.mode == 'test'
+        run: |
+          mkdir -p artifacts
+          bazel run --lockfile_mode=off //tools/bazel/buildifier:buildifier.check \
+            2>&1 | tee artifacts/format.log
+
+      - name: Run Bazel checks and validate outputs
+        run: python3 tools/bazel/ci/sysmgr/run.py "${{ matrix.mode }}" --artifacts "artifacts/${{ matrix.mode }}"
+
+      - name: Upload build evidence and packages
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: buildimage-bazel-sysmgr-${{ matrix.mode }}-amd64
+          path: |
+            artifacts/
+            bazel-testlogs/**/test.log
+            bazel-testlogs/**/test.xml
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 1
