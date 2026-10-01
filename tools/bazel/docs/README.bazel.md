@@ -447,7 +447,7 @@ SWSS Common and gNOI gitlinks, and use the checkout's AMD64 Trixie platform.
   equivalence checker, OCI conversion and dpkg filter patterns.
 - `Bazel sysmgr packages (AMD64)` compiles sysmgr and its gNOI library from source,
   builds the runtime and debug Debian packages, and validates their AMD64 ELF
-  architecture, SONAME links, modes, build IDs, detached DWARF and debug-link CRCs.
+  architecture, SONAME links, modes, build IDs, detached DWARF, debug-link CRCs and GDB source/line lookup.
   It compares those packages with the production runtime layer and collected
   debug layer, and runs the existing two layer ownership/configuration checks.
 

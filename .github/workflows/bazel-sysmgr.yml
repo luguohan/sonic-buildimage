@@ -40,7 +40,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             autoconf automake binutils build-essential busybox ca-certificates \
-            git libtool make pigz pkg-config python3 tar unzip
+            gdb git libtool make pigz pkg-config python3 tar unzip
 
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

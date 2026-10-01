@@ -46,7 +46,7 @@ def sha(path):
 
 
 def output(*command):
-    return subprocess.check_output(command, text=True)
+    return subprocess.check_output(command, cwd=ROOT, text=True)
 
 
 def unpack(archive, destination):
@@ -92,7 +92,17 @@ def verify_packages(paths):
             require(filename.decode() == detached.name, "Wrong debug-link filename")
             offset = (len(filename) + 1 + 3) & ~3
             require(struct.unpack_from("<I", link, offset)[0] == zlib.crc32(detached.read_bytes()), "Debug-link checksum mismatch")
-            pairs.append({"path": relative, "build_id": build_id, "debug_path": str(debug_path),
+            source = "rebootbe.cpp" if relative == BINARIES[0] else "system.pb.cc"
+            decoded = output("readelf", "--debug-dump=decodedline", str(detached))
+            source_line = re.search(r"^\s*" + re.escape(source) + r"\s+(\d+)\s+0x", decoded, re.MULTILINE)
+            require(source_line is not None, "No source line table for " + source)
+            lookup = output("gdb", "-q", "-nx", "-batch",
+                            "-ex", "set debug-file-directory " + str(debug / "usr/lib/debug"),
+                            "-ex", "file " + str(binary),
+                            "-ex", "info line " + source + ":" + source_line.group(1))
+            require(re.search(r'Line \d+ of \".*' + re.escape(source) + r'\" starts at address', lookup),
+                    "GDB cannot resolve deployed symbols: " + lookup)
+            pairs.append({"path": relative, "gdb_source_line": lookup.strip(), "build_id": build_id, "debug_path": str(debug_path),
                           "runtime_sha256": sha(binary), "debug_sha256": sha(detached)})
         library = runtime / BINARIES[1]
         require("[librebootgnoi.so.0]" in output("readelf", "-d", str(library)), "Wrong gNOI SONAME")
